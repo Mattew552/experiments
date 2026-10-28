@@ -1,0 +1,11 @@
+**/bin/
+**/obj/
+.vs/
+docs/
+*.log
+*.pem
+*.pfx
+*.key
+.env
+.env.*
+settings.json

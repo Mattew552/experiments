@@ -161,8 +161,14 @@ internal sealed class MainForm : Form
     private void ShowDiagnostics()
     {
         using var dialog = new Form { Text = "Датчики и диагностика", Width = 900, Height = 520, StartPosition = FormStartPosition.CenterParent };
+        var detected = FanDiscovery.ActiveTachometers(engine.Sensors);
+        var detectedText = detected.Count == 0
+            ? "Активные тахометры не обнаружены."
+            : "Активные тахометры (физические роли не определены):" + Environment.NewLine +
+              string.Join(Environment.NewLine, detected.Select(f => $"{f.Hardware} / {f.Name}: {f.Rpm:F0} RPM [{f.Id}]"));
         var details = new TextBox { Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Both, WordWrap = false, Dock = DockStyle.Fill,
-            Text = diagnostics.Text + Environment.NewLine + discovery.Text + Environment.NewLine + Environment.NewLine + string.Join(Environment.NewLine, channels.Items.Cast<string>()) };
+            Text = diagnostics.Text + Environment.NewLine + discovery.Text + Environment.NewLine + Environment.NewLine + detectedText +
+                   Environment.NewLine + Environment.NewLine + string.Join(Environment.NewLine, channels.Items.Cast<string>()) };
         dialog.Controls.Add(details);
         dialog.ShowDialog(this);
     }

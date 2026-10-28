@@ -54,6 +54,13 @@ internal static class SelfTest
         if (Telemetry.RpmForRole(telemetry, [pairBinding], FanRole.FrontPair) != 1030 ||
             Telemetry.RpmForRole(telemetry, [], FanRole.FrontPair) != null)
             throw new Exception("Нельзя подписывать RPM без проверенной привязки на этом ПК");
+        var discovered = FanDiscovery.ActiveTachometers([
+            new SensorInfo("/lpc/chip/0/fan/0", "Fan #1", "Super I/O", "Fan", 980),
+            new SensorInfo("/lpc/chip/0/fan/1", "Fan #2", "Super I/O", "Fan", 0),
+            new SensorInfo("/gpu/0/fan/0", "GPU", "Graphics", "Fan", 1200)
+        ]);
+        if (discovered.Count != 1 || discovered[0].Rpm != 980)
+            throw new Exception("Автообнаружение должно показывать только активные тахометры платы без записи GPU");
         var processes = Diagnostics.ClassifyProcesses(["MSI.CentralServer", "MSI_Central_Service", "FanControl"]);
         if (processes.MsiBackground.Length != 2 || processes.OtherFanPrograms.Length != 1 || processes.OtherFanPrograms[0] != "FanControl")
             throw new Exception("Фоновые службы MSI ошибочно признаны активной программой управления");

@@ -5,7 +5,9 @@ internal static class FanProbe
     public static bool MayStart(IEnumerable<SensorInfo> sensors, ControlChannel channel, int percent)
     {
         var snapshot = sensors.ToArray();
+        var header = HeaderRoles.Resolve(channel);
         return percent == 100 && channel.AllowsFanWrites && channel.MaximumPercent >= 100 &&
+               header.Role != FanRole.Pump && header.Source != "Excluded" &&
                CpuTemperatureReader.Read(snapshot) is >= 20 and < 65 &&
                snapshot.Any(s => s.Type == "Control" && s.Id == channel.Id &&
                                  s.Origin == channel.Origin && DeviceId(s) == channel.DeviceId && s.Value is >= 0 and < 95);

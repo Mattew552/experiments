@@ -63,6 +63,7 @@ internal sealed class MainForm : Form
         var menu = new MenuStrip();
         var service = new ToolStripMenuItem("Сервис");
         service.DropDownItems.Add("Датчики и диагностика", null, (_, _) => ShowDiagnostics());
+        service.DropDownItems.Add("Проверить остановку корпусных", null, (_, _) => RunAdvanced(() => CheckCaseStop()));
         var profileMenu = new ToolStripMenuItem("Профиль");
         profileMenu.DropDownItems.Add("Переименовать", null, (_, _) => RunAdvanced(RenameProfile));
         profileMenu.DropDownItems.Add("Настроить кривые", null, (_, _) => RunAdvanced(EditCurves));
@@ -175,6 +176,16 @@ internal sealed class MainForm : Form
             MessageBox.Show("Показания вентиляторов уже доступны. Для управления нужна однократная проверка соответствия разъёмов и каналов на этом ПК. Пока команды вентиляторам не отправляются.", "Аппаратная проверка", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
+        if (mode == FanMode.CaseOff)
+        {
+            engine.Tick();
+            if (engine.CpuCoolingProblem == null && settings.Bindings.Any(b => b.IsVerified && FanRoles.IsCase(b.Role)) &&
+                !settings.Bindings.Any(b => b.IsVerified && FanRoles.IsCase(b.Role) && b.StopVerified))
+            {
+                if (!CheckCaseStop()) return;
+                engine.Tick();
+            }
+        }
         engine.SelectMode(mode); Render();
     }
     private void RunAdvanced(Action action)
@@ -190,18 +201,41 @@ internal sealed class MainForm : Form
         if (engine.Status.StartsWith("Возврат BIOS не подтверждён", StringComparison.Ordinal))
             throw new InvalidOperationException("Сначала проверьте возврат управления плате");
         if (hardware is not WorkerHardware worker) throw new InvalidOperationException("Сторож управления недоступен");
-        using var dialog = new SystemSetupForm(hardware, worker, settings, reason =>
-        {
-            engine.BlockControl(reason);
-            try { worker.BlockControl(); }
-            catch (Exception ex) { AppLog.Write("Не удалось подтвердить блокировку сторожа: " + ex.Message); }
-        });
+        using var dialog = new SystemSetupForm(hardware, worker, settings, BlockCurrentControl);
         scanning = true;
         probeCancellation = dialog.Cancellation;
         try { dialog.ShowDialog(this); }
         finally { scanning = false; probeCancellation = null; }
         engine.Tick();
         Render();
+    }
+    private void BlockCurrentControl(string reason)
+    {
+        engine.BlockControl(reason);
+        if (hardware is not WorkerHardware worker) return;
+        try { worker.BlockControl(); }
+        catch (Exception ex) { AppLog.Write("Не удалось подтвердить блокировку сторожа: " + ex.Message); }
+    }
+    private bool CheckCaseStop()
+    {
+        if (scanning) throw new InvalidOperationException("Дождитесь завершения текущей проверки");
+        if (engine.ControlBlockReason != null) throw new InvalidOperationException(engine.ControlBlockReason);
+        engine.RestoreBios("Подготовка проверки остановки");
+        if (engine.Status.StartsWith("Возврат BIOS не подтверждён", StringComparison.Ordinal))
+            throw new InvalidOperationException("Возврат исходного режима не подтверждён");
+        engine.Tick();
+        if (engine.CpuCoolingProblem is { } cpuProblem) throw new InvalidOperationException(cpuProblem);
+        if (engine.CpuTemperature is not (>= 20 and < 60)) throw new InvalidOperationException("Для проверки остановки нужна температура CPU ниже 60 °C");
+        if (!settings.Bindings.Any(b => b.IsVerified && FanRoles.IsCase(b.Role) && !b.StopVerified))
+        {
+            MessageBox.Show(this, "Нет новых корпусных групп для проверки остановки. Уже проверенные группы доступны обычной кнопкой.", "FanGuardian");
+            return false;
+        }
+        if (hardware is not WorkerHardware worker) throw new InvalidOperationException("Сторож управления недоступен");
+        using var dialog = new StopTestForm(worker, settings, BlockCurrentControl);
+        scanning = true; probeCancellation = dialog.Cancellation;
+        try { return dialog.ShowDialog(this) == DialogResult.OK; }
+        finally { scanning = false; probeCancellation = null; engine.Tick(); Render(); }
     }
     private void ShowDiagnostics()
     {

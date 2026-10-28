@@ -9,6 +9,8 @@ internal static class MachineIdentity
 {
     private sealed record BoardIdentity(string Manufacturer, string Product, string Version, string Serial, string Bios);
     private static readonly Lazy<BoardIdentity?> board = new(ReadBoard);
+    public static string BoardManufacturer => board.Value?.Manufacturer ?? "";
+    public static string BoardProduct => board.Value?.Product ?? "";
     public static string HardwareFingerprint => board.Value is { } value ? Hash(string.Join("|", value.Manufacturer, value.Product, value.Version, value.Serial, value.Bios)) : "";
     public static bool IsVerifiedLegacyBoard => board.Value is { } value &&
         value.Manufacturer.Contains("Micro-Star", StringComparison.OrdinalIgnoreCase) &&

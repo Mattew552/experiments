@@ -92,6 +92,7 @@ internal sealed class Engine : IDisposable
                     continue;
                 }
                 var percent = Mode == FanMode.CaseOff ? 0 : CurvePercent(b);
+                safe.ValidateSet(b.ControlId, percent);
                 // A backend may apply a write before it reports a failure.
                 captured.Add(b.ControlId);
                 safe.Set(b.ControlId, percent);
@@ -160,11 +161,8 @@ internal sealed class Engine : IDisposable
             RestoreBios("Ручной режим не включён: запуск вентилятора не подтверждён");
             throw new InvalidOperationException("Ручной режим не включён: дождитесь ненулевых рабочих RPM. Запуск остановленной новой группы на минимальной скорости ещё не проверен.");
         }
-        if (requested == FanMode.CaseOff &&
-            (!VerifiedBindings.Any(b => FanRoles.IsCase(b.Role) && b.StopVerified) ||
-             !VerifiedBindings.Any(b => b.Role == FanRole.Cpu) ||
-             VerifiedBindings.Where(b => b.Role == FanRole.Cpu).Any(b => !HasRunningRpm(b))))
-            throw new InvalidOperationException("Для остановки нужны проверенная корпусная группа и работающий CPU-кулер");
+        if (requested == FanMode.CaseOff && CaseOffProblem is { } problem)
+            throw new InvalidOperationException(problem);
         if (Mode == FanMode.CaseOff && requested == FanMode.Manual)
         {
             RestoreBios("Переход от остановки к ручному режиму");
@@ -201,6 +199,29 @@ internal sealed class Engine : IDisposable
     {
         ControlBlockReason = string.IsNullOrWhiteSpace(reason) ? "Безопасность возврата режима не подтверждена" : reason.Trim();
         RestoreBios("Блокировка управления: " + ControlBlockReason);
+    }
+    public string? CaseOffProblem
+    {
+        get
+        {
+            if (CpuCoolingProblem is { } cpuProblem) return cpuProblem;
+            if (!VerifiedBindings.Any(b => FanRoles.IsCase(b.Role))) return "Не назначены корпусные группы. Сохраните их назначение в мастере подключения.";
+            if (!VerifiedBindings.Any(b => FanRoles.IsCase(b.Role) && b.StopVerified))
+                return "Скорость корпусных групп проверена, но остановка и повторный запуск ещё не проверены. Нужна однократная проверка остановки.";
+            return null;
+        }
+    }
+    public string? CpuCoolingProblem
+    {
+        get
+        {
+            var cpu = VerifiedBindings.Where(b => b.Role == FanRole.Cpu).ToArray();
+            if (cpu.Length == 0) return "Не определён CPU-кулер. В мастере «Подключить новую систему» проверьте назначение CPU_FAN и сохраните группы.";
+            var missing = cpu.FirstOrDefault(b => !HasRunningRpm(b));
+            if (missing == null) return null;
+            var rpm = Sensors.FirstOrDefault(s => s.Type == "Fan" && s.Id == missing.RpmId)?.Value;
+            return $"Нет рабочих RPM CPU-кулера «{missing.DisplayLabel}»: {(rpm.HasValue ? rpm.Value.ToString("F0") : "нет показаний")}, нужно не менее {missing.MinimumRunningRpm}. Корпусные вентиляторы не остановлены.";
+        }
     }
     public void Dispose() { RestoreBios("Выход"); raw.Dispose(); }
 }

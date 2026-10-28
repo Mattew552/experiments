@@ -21,7 +21,7 @@ internal sealed record ControlChannel(
         !string.IsNullOrWhiteSpace(DeviceId);
 }
 
-internal sealed record HardwareSnapshot(SensorInfo[] Sensors, ControlChannel[] Channels);
+internal sealed record HardwareSnapshot(SensorInfo[] Sensors, ControlChannel[] Channels, string? StopTestPhase = null);
 
 internal static class SuperIoRestoreCatalog
 {

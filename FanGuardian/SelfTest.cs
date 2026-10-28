@@ -21,6 +21,8 @@ internal static class SelfTest
         SetupTests.Run();
         HardwareCapabilityTests.Run();
         WorkerHostTests.Run();
+        HeaderRoleTests.Run();
+        StopTestTests.Run();
         const string cpuFan = "/lpc/nct6797d/0/fan/1";
         const string frontPair = "/lpc/nct6797d/0/fan/4";
         const string frontTop = "/lpc/nct6797d/0/fan/5";

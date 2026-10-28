@@ -46,6 +46,7 @@ internal sealed class WorkerHardware : IFanHardware
     private long sequence;
     private bool disposed;
     public IReadOnlyList<ControlChannel> Channels { get; private set; } = Array.Empty<ControlChannel>();
+    public string? StopTestPhase { get; private set; }
 
     public WorkerHardware(string heartbeat)
     {
@@ -70,6 +71,7 @@ internal sealed class WorkerHardware : IFanHardware
     {
         var snapshot = Send("read", "", 0).Snapshot ?? throw new InvalidDataException("Сторож не прислал показания");
         Channels = snapshot.Channels;
+        StopTestPhase = snapshot.StopTestPhase;
         return snapshot.Sensors;
     }
     public void Set(string controlId, int percent) => Send("set", controlId, percent);
@@ -78,6 +80,8 @@ internal sealed class WorkerHardware : IFanHardware
     public void ProbeEnd(string controlId) => Send("probe-end", controlId, 0);
     public void ReloadBindings() => Send("reload-bindings", "", 0);
     public void BlockControl() => Send("block-control", "", 0);
+    public void BeginStopTest(string controlId) => Send("stop-test-start", controlId, 0);
+    public void EndStopTest(string controlId) => Send("stop-test-end", controlId, 0);
 
     private WorkerReply Send(string operation, string id, int percent)
     {
@@ -133,7 +137,12 @@ internal static class WorkerHost
         var ready = Path.Combine(directory, "ready");
         var touched = new HashSet<string>(StringComparer.Ordinal);
         var pendingRestore = new HashSet<string>(StringComparer.Ordinal);
+        var pendingRestart = new HashSet<string>(StringComparer.Ordinal);
         string? activeProbe = null;
+        string? activeStop = null;
+        string? stopPhase = null;
+        TimeSpan stopDeadline = default;
+        TimeSpan nextStopSafetyCheck = default;
         var controlBlocked = false;
         var clock = Stopwatch.StartNew();
         TimeSpan probeDeadline = default;
@@ -146,6 +155,32 @@ internal static class WorkerHost
             var settings = loadSettings();
             using var hardware = createHardware();
             var safe = new SafeHardware(hardware, settings.Bindings, ownsInner: false);
+            bool Running(IReadOnlyList<SensorInfo> sensors, FanBinding binding) =>
+                sensors.FirstOrDefault(s => s.Type == "Fan" && s.Id == binding.RpmId)?.Value is float rpm &&
+                float.IsFinite(rpm) && rpm >= Math.Max(1, binding.MinimumRunningRpm);
+            bool StopCoolingSafe(IReadOnlyList<SensorInfo> sensors) =>
+                CpuTemperatureReader.Read(sensors) is >= 20 and < 60 &&
+                settings.Bindings.Any(b => b.IsVerified && b.Role == FanRole.Cpu) &&
+                settings.Bindings.Where(b => b.IsVerified && b.Role == FanRole.Cpu).All(b => Running(sensors, b)) &&
+                !otherFanProgramRunning();
+            void RecoverStopped(string id)
+            {
+                var binding = settings.Bindings.FirstOrDefault(b => b.ControlId == id && b.IsVerified && FanRoles.IsCase(b.Role))
+                    ?? throw new InvalidOperationException("Корпусная группа для восстановления не найдена");
+                var restarted = false;
+                try
+                {
+                    hardware.Set(id, 100);
+                    var recovery = Stopwatch.StartNew();
+                    do
+                    {
+                        if (Running(hardware.Read(), binding)) { restarted = true; break; }
+                        Thread.Sleep(100);
+                    } while (recovery.Elapsed < TimeSpan.FromSeconds(4));
+                }
+                finally { hardware.Default(id); }
+                if (!restarted) throw new InvalidOperationException("Повторный запуск корпусного вентилятора не подтверждён");
+            }
             hardware.Read();
             lastHeartbeatAt = clock.Elapsed;
             lastHeartbeatStamp = File.Exists(heartbeat) ? File.GetLastWriteTimeUtc(heartbeat) : DateTime.MinValue;
@@ -179,8 +214,43 @@ internal static class WorkerHost
                         nextRestoreAttempt = clock.Elapsed.Add(TimeSpan.FromSeconds(1));
                         foreach (var id in pendingRestore.ToArray())
                         {
-                            try { hardware.Default(id); touched.Remove(id); pendingRestore.Remove(id); }
+                            try
+                            {
+                                if (pendingRestart.Contains(id)) RecoverStopped(id); else hardware.Default(id);
+                                touched.Remove(id); pendingRestore.Remove(id); pendingRestart.Remove(id);
+                            }
                             catch (Exception ex) { AppLog.Write("Сторож: повтор возврата не удался " + id + " " + ex.Message); }
+                        }
+                    }
+                    // The zero-speed phase is owned by the worker, not by UI
+                    // timing. It always advances to a bounded full-speed restart.
+                    if (activeStop != null && stopPhase == "stopping" && clock.Elapsed >= stopDeadline)
+                    {
+                        try
+                        {
+                            hardware.Set(activeStop, 100);
+                            stopPhase = "restarting";
+                            stopDeadline = clock.Elapsed.Add(TimeSpan.FromSeconds(15));
+                        }
+                        catch
+                        {
+                            controlBlocked = true;
+                            pendingRestore.Add(activeStop);
+                            pendingRestart.Add(activeStop);
+                            activeStop = null; stopPhase = null;
+                        }
+                    }
+                    if (activeStop != null && (clock.Elapsed >= stopDeadline || clock.Elapsed >= nextStopSafetyCheck))
+                    {
+                        nextStopSafetyCheck = clock.Elapsed.Add(TimeSpan.FromSeconds(1));
+                        if (clock.Elapsed >= stopDeadline || !StopCoolingSafe(hardware.Read()))
+                        {
+                            var id = activeStop;
+                            controlBlocked = true;
+                            activeStop = null; stopPhase = null;
+                            pendingRestore.Add(id); pendingRestart.Add(id);
+                            try { RecoverStopped(id); touched.Remove(id); pendingRestore.Remove(id); pendingRestart.Remove(id); }
+                            catch (Exception ex) { AppLog.Write("Сторож: ошибка завершения проверки остановки " + ex); }
                         }
                     }
                     // An expired lease restores first; it must not start another
@@ -224,12 +294,12 @@ internal static class WorkerHost
                                 switch (request.Operation)
                                 {
                                     case "read":
-                                        snapshot = new HardwareSnapshot(hardware.Read().ToArray(), hardware.Channels.ToArray());
+                                        snapshot = new HardwareSnapshot(hardware.Read().ToArray(), hardware.Channels.ToArray(), stopPhase);
                                         break;
                                     case "set":
                                     {
                                         if (controlBlocked) throw new InvalidOperationException("Управление заблокировано до перезапуска приложения");
-                                        if (activeProbe != null || pendingRestore.Count > 0)
+                                        if (activeProbe != null || activeStop != null || pendingRestore.Count > 0)
                                             throw new InvalidOperationException("Проба или возврат режима ещё не завершены");
                                         var temperature = CpuTemperatureReader.Read(hardware.Read());
                                         var limit = request.Percent == 0 ? 65 : 80;
@@ -242,7 +312,7 @@ internal static class WorkerHost
                                         break;
                                     }
                                     case "default":
-                                        if (activeProbe != null) throw new InvalidOperationException("Во время пробы другая запись запрещена");
+                                        if (activeProbe != null || activeStop != null) throw new InvalidOperationException("Во время пробы другая запись запрещена");
                                         try
                                         {
                                             if (touched.Contains(request.ControlId)) hardware.Default(request.ControlId);
@@ -258,7 +328,7 @@ internal static class WorkerHost
                                     case "probe-start":
                                     {
                                         if (controlBlocked) throw new InvalidOperationException("Управление заблокировано до перезапуска приложения");
-                                        if (activeProbe != null || touched.Count != 0 || otherFanProgramRunning())
+                                        if (activeProbe != null || activeStop != null || touched.Count != 0 || otherFanProgramRunning())
                                             throw new InvalidOperationException("Проба канала запрещена до возврата всех каналов");
                                         var sensors = hardware.Read();
                                         var channel = hardware.Channels.FirstOrDefault(c => c.Id == request.ControlId);
@@ -270,6 +340,50 @@ internal static class WorkerHost
                                         activeProbe = request.ControlId;
                                         probeDeadline = clock.Elapsed.Add(TimeSpan.FromSeconds(20));
                                         nextProbeSafetyCheck = clock.Elapsed.Add(TimeSpan.FromSeconds(1));
+                                        break;
+                                    }
+                                    case "stop-test-start":
+                                    {
+                                        if (controlBlocked || activeProbe != null || activeStop != null || touched.Count != 0)
+                                            throw new InvalidOperationException("Проверка остановки недоступна до возврата всех каналов");
+                                        var sensors = hardware.Read();
+                                        var binding = settings.Bindings.FirstOrDefault(b => b.ControlId == request.ControlId && b.IsVerified && FanRoles.IsCase(b.Role));
+                                        if (request.Percent != 0 || binding == null || otherFanProgramRunning() ||
+                                            !StopTestCoordinator.MayStart(binding, settings.Bindings, sensors, hardware.Channels))
+                                            throw new InvalidOperationException("Для остановки нужны подтверждённая корпусная группа, работающий CPU-кулер и температура ниже60°C");
+                                        touched.Add(request.ControlId);
+                                        pendingRestart.Add(request.ControlId);
+                                        activeStop = request.ControlId;
+                                        stopPhase = "stopping";
+                                        stopDeadline = clock.Elapsed.Add(TimeSpan.FromSeconds(5));
+                                        nextStopSafetyCheck = clock.Elapsed.Add(TimeSpan.FromSeconds(1));
+                                        try { hardware.Set(request.ControlId, 0); }
+                                        catch
+                                        {
+                                            controlBlocked = true;
+                                            pendingRestore.Add(request.ControlId);
+                                            activeStop = null; stopPhase = null;
+                                            throw;
+                                        }
+                                        break;
+                                    }
+                                    case "stop-test-end":
+                                    {
+                                        if (activeStop != request.ControlId || stopPhase != "restarting")
+                                            throw new InvalidOperationException("Дождитесь фазы повторного запуска корпусного вентилятора");
+                                        var binding = settings.Bindings.First(b => b.ControlId == request.ControlId);
+                                        if (!Running(hardware.Read(), binding))
+                                            throw new InvalidOperationException("Повторный запуск корпусного вентилятора ещё не подтверждён");
+                                        try { hardware.Default(request.ControlId); }
+                                        catch
+                                        {
+                                            controlBlocked = true;
+                                            activeStop = null; stopPhase = null;
+                                            pendingRestore.Add(request.ControlId);
+                                            throw;
+                                        }
+                                        touched.Remove(request.ControlId); pendingRestart.Remove(request.ControlId);
+                                        activeStop = null; stopPhase = null;
                                         break;
                                     }
                                     case "probe-end":
@@ -291,10 +405,15 @@ internal static class WorkerHost
                                         // including after a successful settings reload.
                                         controlBlocked = true;
                                         activeProbe = null;
+                                        activeStop = null; stopPhase = null;
                                         var failures = new List<string>();
                                         foreach (var id in touched.ToArray())
                                         {
-                                            try { hardware.Default(id); touched.Remove(id); pendingRestore.Remove(id); }
+                                            try
+                                            {
+                                                if (pendingRestart.Contains(id)) RecoverStopped(id); else hardware.Default(id);
+                                                touched.Remove(id); pendingRestore.Remove(id); pendingRestart.Remove(id);
+                                            }
                                             catch (Exception ex)
                                             {
                                                 pendingRestore.Add(id);
@@ -307,7 +426,7 @@ internal static class WorkerHost
                                         break;
                                     }
                                     case "reload-bindings":
-                                        if (activeProbe != null || touched.Count != 0)
+                                        if (activeProbe != null || activeStop != null || touched.Count != 0)
                                             throw new InvalidOperationException("Сначала верните все каналы в исходный режим");
                                         settings = loadSettings();
                                         safe = new SafeHardware(hardware, settings.Bindings, ownsInner: false);
@@ -323,6 +442,7 @@ internal static class WorkerHost
                                 {
                                     controlBlocked = true;
                                     activeProbe = null;
+                                    activeStop = null; stopPhase = null;
                                     pendingRestore.UnionWith(touched);
                                 }
                                 reply = new(request.Sequence, false, ex.Message);
@@ -340,7 +460,11 @@ internal static class WorkerHost
             {
                 foreach (var id in touched)
                 {
-                    try { hardware.Default(id); AppLog.Write("Сторож: восстановлен исходный режим " + id); }
+                    try
+                    {
+                        if (pendingRestart.Contains(id)) RecoverStopped(id); else hardware.Default(id);
+                        AppLog.Write("Сторож: восстановлен исходный режим " + id);
+                    }
                     catch (Exception ex) { AppLog.Write("Сторож: ОШИБКА восстановления " + id + " " + ex); }
                 }
             }

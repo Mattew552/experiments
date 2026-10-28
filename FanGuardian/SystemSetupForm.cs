@@ -13,7 +13,8 @@ internal sealed class SystemSetupForm : Form
         FlowDirection = FlowDirection.TopDown, WrapContents = false, Padding = new(12) };
     private readonly Button save = new() { Text = "Сохранить выбранные группы", AutoSize = true, Enabled = false };
     private readonly Button close = new() { Text = "Остановить проверку", AutoSize = true };
-    private readonly List<(ProbeChannelResult Result, ComboBox Role, TextBox Label)> choices = new();
+    private readonly List<(ProbeChannelResult Result, ComboBox Role, TextBox Label, HeaderHint Hint)> choices = new();
+    private readonly List<(FanBinding Binding, ComboBox Role, TextBox Label, HeaderHint Hint)> existingChoices = new();
     private bool running = true;
 
     public CancellationTokenSource Cancellation => cancellation;
@@ -59,10 +60,10 @@ internal sealed class SystemSetupForm : Form
                 progress.Text = "Проверка прервана: " + report.Error + ". Управление в этой сессии заблокировано; проверьте охлаждение и журнал.";
             }
             else if (report.Cancelled) progress.Text = "Проверка остановлена. Завершённые результаты показаны ниже; управление не включено.";
-            else progress.Text = choices.Count == 0
+            else progress.Text = choices.Count + existingChoices.Count == 0
                 ? "Однозначных новых связей с проверенным диапазоном не найдено. Доступные датчики продолжат отображаться."
-                : "Выберите назначение только тех групп, которые можете определить физически. Помпы и неизвестные группы оставьте без управления. Новым группам остановка не разрешается.";
-            save.Enabled = report.Error == null && !report.Cancelled && choices.Count > 0;
+                : "Роли подставлены по именам разъёмов или профилю платы. Проверьте подключение: CPU — кулер процессора, корпус — корпусные вентиляторы. Помпы оставьте без управления. Остановка новых групп проверяется отдельно.";
+            save.Enabled = report.Error == null && !report.Cancelled && choices.Count + existingChoices.Count > 0;
         }
         catch (Exception ex)
         {
@@ -75,25 +76,25 @@ internal sealed class SystemSetupForm : Form
 
     private void AddResult(ProbeChannelResult result)
     {
-        results.Controls.Add(new Label { Text = $"{result.Control.Name}: {result.Description}", AutoSize = true, MaximumSize = new(780, 0), Margin = new(3, 12, 3, 4) });
+        var hint = HeaderRoles.Resolve(result.Control);
+        results.Controls.Add(new Label { Text = $"{hint.Name}: {result.Description}", AutoSize = true, MaximumSize = new(780, 0), Margin = new(3, 12, 3, 4) });
         var existing = settings.Bindings.FirstOrDefault(b => b.ControlId == result.Control.Id && b.IsVerified);
         if (revoked.Contains(result.Control.Id))
             results.Controls.Add(new Label { Text = "Обнаружено другое соответствие RPM. Прежняя привязка и разрешение остановки отключены.", AutoSize = true, MaximumSize = new(780, 0) });
-        if (existing != null)
-        {
-            results.Controls.Add(new Label { Text = "Уже настроено: " + existing.Label + ". Текущая привязка сохранена.", AutoSize = true });
-            return;
-        }
-        if (!result.AssociationVerified || !result.RestoreVerified || result.BaselineRpm <= 0 || result.BaselinePercent <= 0) return;
+        if (existing == null && (!result.AssociationVerified || !result.RestoreVerified || result.BaselineRpm <= 0 || result.BaselinePercent <= 0)) return;
         var row = new FlowLayoutPanel { AutoSize = true, WrapContents = false };
         var role = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 240 };
-        role.Items.AddRange(["Не использовать", "Корпусной вентилятор / группа", "Кулер CPU"]);
-        role.SelectedIndex = 0;
-        var label = new TextBox { Width = 310, Text = result.Control.Name, MaxLength = 80 };
+        role.Items.AddRange(["Не управлять / помпа", "Корпусной вентилятор / группа", "Кулер CPU"]);
+        var suggestedRole = existing is { RoleSource.Length: > 0 } ? existing.Role : hint.Role;
+        if (suggestedRole == FanRole.Unknown && existing != null) suggestedRole = existing.Role;
+        role.SelectedIndex = suggestedRole == FanRole.Cpu ? 2 : FanRoles.IsCase(suggestedRole) ? 1 : 0;
+        var label = new TextBox { Width = 310, Text = existing?.DisplayLabel ?? hint.Name, MaxLength = 80 };
         row.Controls.Add(role); row.Controls.Add(label);
         results.Controls.Add(row);
-        results.Controls.Add(new Label { Text = $"Проверенный ненулевой диапазон: {Math.Max(40, result.BaselinePercent)}–100%. Название справа можно изменить.", AutoSize = true });
-        choices.Add((result, role, label));
+        results.Controls.Add(new Label { Text = $"Источник имени: {hint.Description}. Диапазон {Math.Max(40, existing?.MinimumPercent ?? result.BaselinePercent)}–100%." +
+            (existing?.StopVerified == true ? " Остановка была проверена ранее." : " Остановка ещё не проверена."), AutoSize = true });
+        if (existing != null) existingChoices.Add((existing, role, label, hint));
+        else choices.Add((result, role, label, hint));
     }
 
     private void SaveSelection()
@@ -101,7 +102,11 @@ internal sealed class SystemSetupForm : Form
         try
         {
             var selected = choices.Where(c => c.Role.SelectedIndex > 0)
-                .Select(c => BindingSetup.Create(c.Result, c.Role.SelectedIndex == 2 ? FanRole.Cpu : FanRole.Case, c.Label.Text)).ToArray();
+                .Select(c => BindingSetup.Create(c.Result, c.Role.SelectedIndex == 2 ? FanRole.Cpu : FanRole.Case, c.Label.Text, c.Hint))
+                .Concat(existingChoices.Select(c => BindingSetup.UpdateRole(c.Binding,
+                    c.Role.SelectedIndex == 2 ? FanRole.Cpu : c.Role.SelectedIndex == 1
+                        ? (FanRoles.IsCase(c.Binding.Role) ? c.Binding.Role : FanRole.Case) : FanRole.Unknown,
+                    c.Label.Text, c.Hint))).ToArray();
             if (selected.Length == 0) throw new InvalidOperationException("Выберите хотя бы одну известную группу или закройте окно");
             var originalBindings = settings.Bindings.ToList();
             var originalCurves = settings.Profiles.Select(p => new Dictionary<string, List<CurvePoint>>(p.Curves, StringComparer.Ordinal)).ToArray();

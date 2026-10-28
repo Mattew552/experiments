@@ -41,6 +41,38 @@ internal static class HardwareCapabilityTests
         if (!fake.Writes.SequenceEqual(new[] { "port-1:40", "port-1:default" }))
             throw new Exception("Capabilities permitted an unauthorized hardware command");
 
+        var cpuHeader = valid with { Id = "cpu-header", Name = "CPU_FAN1" };
+        var pumpHeader = valid with { Id = "pump-header", Name = "CPU Pump Fan" };
+        var gpuHeader = valid with { Id = "gpu-header", Name = "GPU Fan" };
+        var headers = new Fake { Channels = [cpuHeader, pumpHeader, gpuHeader] };
+        var staleBindings = headers.Channels.Select(c =>
+        {
+            var stale = Binding(c.Id);
+            stale.StopVerified = true;
+            return stale;
+        });
+        using (var staleSafe = new SafeHardware(headers, staleBindings))
+        {
+            Denied(() => staleSafe.Set(cpuHeader.Id, 0));
+            Denied(() => staleSafe.Set(pumpHeader.Id, 80));
+            Denied(() => staleSafe.Default(pumpHeader.Id));
+            Denied(() => staleSafe.Set(gpuHeader.Id, 80));
+            Denied(() => staleSafe.Default(gpuHeader.Id));
+            staleSafe.Set(cpuHeader.Id, 80);
+        }
+        if (!headers.Writes.SequenceEqual(["cpu-header:80"]))
+            throw new Exception("Stale case authorization bypassed a CPU/pump/GPU header");
+        foreach (var header in new[] { cpuHeader, pumpHeader, gpuHeader })
+        {
+            var sensors = new SensorInfo[]
+            {
+                new("/intelcpu/0/temperature/0", "CPU Package", "CPU", "Temperature", 45),
+                new(header.Id, header.Name, "Board", "Control", 50, header.DeviceId, header.Origin)
+            };
+            if (FanProbe.MayStart(sensors, header, 100) != (header.Id == cpuHeader.Id))
+                throw new Exception("High probe confused CPU fan with excluded pump/GPU header");
+        }
+
         if (SuperIoRestoreCatalog.RestoreFor("/lpc/nct6797d/0") != RestoreStrategy.RestoreOriginal ||
             SuperIoRestoreCatalog.RestoreFor("/lpc/f71889ad/0") != RestoreStrategy.RestoreOriginal ||
             SuperIoRestoreCatalog.RestoreFor("/lpc/it8689e/0") != RestoreStrategy.None ||

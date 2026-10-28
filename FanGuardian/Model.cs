@@ -26,6 +26,8 @@ internal sealed class FanBinding
     public string ControlId { get; set; } = "";
     public string RpmId { get; set; } = "";
     public string Label { get; set; } = "";
+    public string HeaderName { get; set; } = "";
+    public string RoleSource { get; set; } = "";
     public FanRole Role { get; set; } = FanRole.Unknown;
     public int MinimumPercent { get; set; } = 30;
     public int MinimumRunningRpm { get; set; } = 250;

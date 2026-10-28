@@ -105,9 +105,13 @@ internal sealed class SafeHardware : IFanHardware
     public IReadOnlyList<SensorInfo> Read() => inner.Read();
     private FanBinding Require(string id)
     {
+        var channel = inner.Channels.FirstOrDefault(c => c.Id == id);
         if (!allowed.TryGetValue(id, out var binding) ||
-            !inner.Channels.Any(c => c.Id == id && c.AllowsFanWrites))
+            channel?.AllowsFanWrites != true)
             throw new InvalidOperationException("Запись запрещена: канал или его возможности не подтверждены");
+        var header = HeaderRoles.Resolve(channel);
+        if (header.Role == FanRole.Pump || header.Source == "Excluded")
+            throw new InvalidOperationException("Запись запрещена: выход помпы или исключённого устройства");
         return binding;
     }
     public void Set(string controlId, int percent)
@@ -119,10 +123,12 @@ internal sealed class SafeHardware : IFanHardware
     {
         var b = Require(controlId);
         var channel = inner.Channels.Single(c => c.Id == controlId);
+        var header = HeaderRoles.Resolve(channel);
         var minimum = Math.Max(channel.MinimumPercent, b.Role == FanRole.Cpu ? Math.Max(30, b.MinimumPercent) : b.MinimumPercent);
         if (percent < 0 || percent > channel.MaximumPercent || percent > 100 || (percent != 0 && percent < minimum))
             throw new ArgumentOutOfRangeException(nameof(percent));
-        if (percent == 0 && (!FanRoles.IsCase(b.Role) || !b.StopVerified || channel.MinimumPercent > 0))
+        if (percent == 0 && (!FanRoles.IsCase(b.Role) || !b.StopVerified || channel.MinimumPercent > 0 ||
+                             header.Role is FanRole.Cpu or FanRole.Pump || header.Source == "Excluded"))
             throw new InvalidOperationException("Остановка канала не подтверждена");
     }
     public void Default(string controlId) { Require(controlId); inner.Default(controlId); }

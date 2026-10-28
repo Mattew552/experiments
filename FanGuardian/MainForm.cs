@@ -17,8 +17,8 @@ internal sealed class MainForm : Form
     private readonly Label diagnostics = new() { AutoSize = true, MaximumSize = new(740, 0) };
     private readonly Label discovery = new() { AutoSize = true, MaximumSize = new(740, 0) };
     private readonly ListBox channels = new() { Width = 740, Height = 190, HorizontalScrollbar = true };
-    private readonly RpmGraph pairGraph = new("Два передних вместе · SYS_FAN3", Color.FromArgb(75, 194, 255));
-    private readonly RpmGraph topGraph = new("Верхний передний · SYS_FAN4", Color.FromArgb(134, 224, 171));
+    private readonly FlowLayoutPanel graphPanel = new() { AutoSize = true, FlowDirection = FlowDirection.TopDown, WrapContents = false };
+    private readonly Dictionary<string, RpmGraph> graphs = new(StringComparer.Ordinal);
     private readonly ComboBox profiles = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 230 };
     private readonly string heartbeat = Path.Combine(Settings.DirectoryPath, "heartbeat");
     private bool exitRequested;
@@ -52,8 +52,7 @@ internal sealed class MainForm : Form
         editCurves.LinkClicked += (_, _) => RunAdvanced(EditCurves);
         manualSettings.Controls.Add(editCurves);
         root.Controls.Add(manualSettings);
-        root.Controls.Add(pairGraph);
-        root.Controls.Add(topGraph);
+        root.Controls.Add(graphPanel);
         root.Controls.Add(footer);
         var menu = new MenuStrip();
         var service = new ToolStripMenuItem("Сервис");
@@ -123,17 +122,22 @@ internal sealed class MainForm : Form
         var access = Diagnostics.Read();
         diagnostics.Text = "Диагностика: " + access.Summary + (access.SensorAccessLikely ? "" : ". При 0 °C и отсутствии RPM управление заблокировано.");
         var controlCount = engine.Sensors.Count(s => s.Type == "Control" && s.Id.StartsWith("/lpc/", StringComparison.OrdinalIgnoreCase));
-        var rpmCount = engine.Sensors.Count(s => s.Type == "Fan" && s.Id.StartsWith("/lpc/", StringComparison.OrdinalIgnoreCase) && s.Value is > 0);
-        discovery.Text = $"Найдено записей Control: {controlCount}; датчиков с ненулевыми RPM: {rpmCount}. Номера Fan # не определяют физическую роль. Ожидаются только два передних управляемых канала и CPU-кулер; остальные записи остаются без привязки.";
+        var rpmCount = FanDiscovery.ActiveTachometers(engine.Sensors).Count;
+        discovery.Text = $"Найдено записей Control: {controlCount}; датчиков с ненулевыми RPM: {rpmCount}. Номера Fan # не определяют физическую роль или возможность управления.";
         var hasPair = settings.Bindings.Any(b => b.Role == FanRole.FrontPair && b.MappingVerified && b.ReturnVerified && b.SpeedVerified);
         var hasTop = settings.Bindings.Any(b => b.Role == FanRole.FrontTop && b.MappingVerified && b.ReturnVerified && b.SpeedVerified);
-        pairGraph.Visible = hasPair;
-        topGraph.Visible = hasTop;
-        pairGraph.Add(Telemetry.RpmForRole(engine.Sensors, settings.Bindings, FanRole.FrontPair));
-        topGraph.Add(Telemetry.RpmForRole(engine.Sensors, settings.Bindings, FanRole.FrontTop));
+        foreach (var fan in FanDiscovery.ActiveTachometers(engine.Sensors))
+        {
+            if (graphs.ContainsKey(fan.Id)) continue;
+            var color = new[] { Color.FromArgb(75, 194, 255), Color.FromArgb(134, 224, 171), Color.FromArgb(255, 193, 113) }[graphs.Count % 3];
+            var graph = new RpmGraph(Telemetry.Caption(fan, settings.Bindings), color);
+            graphs.Add(fan.Id, graph);
+            graphPanel.Controls.Add(graph);
+        }
+        foreach (var (id, graph) in graphs) graph.Add(Telemetry.Rpm(engine.Sensors, id));
         footer.Text = hasPair && hasTop
-            ? "Графики обновляются автоматически. Соответствие передних каналов подтверждено на этом ПК. Задний вентилятор с питанием Molex не управляется программой."
-            : "Датчики читаются автоматически. Соответствие каналов этому ПК не подтверждено, управление выключено.";
+            ? "Графики обновляются автоматически. Передние каналы проверены на этом ПК. Задний вентилятор питается от Molex и не управляется программой."
+            : "Графики найденных тахометров обновляются автоматически. Их физические роли и каналы управления пока не проверены; запись выключена.";
         tray.Text = ("FanGuardian: " + engine.Mode + "; CPU " + (engine.CpuTemperature?.ToString("F0") ?? "?")) switch { var s when s.Length > 63 => s[..63], var s => s };
         var selected = channels.SelectedIndex;
         channels.Items.Clear();

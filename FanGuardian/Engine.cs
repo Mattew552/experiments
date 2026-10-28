@@ -38,9 +38,7 @@ internal sealed class Engine : IDisposable
         try
         {
             Sensors = raw.Read();
-            CpuTemperature = Sensors.Where(s => s.Type == "Temperature" && s.Hardware.Contains("AMD Ryzen", StringComparison.OrdinalIgnoreCase)
-                && (s.Name.Contains("Package", StringComparison.OrdinalIgnoreCase) || s.Name.Contains("Tctl/Tdie", StringComparison.OrdinalIgnoreCase)))
-                .Select(s => s.Value).FirstOrDefault();
+            CpuTemperature = CpuTemperatureReader.Read(Sensors);
             if (CpuTemperature is > 0 and < 120) lastValidTemperature = DateTimeOffset.UtcNow;
             else CpuTemperature = null;
             var stale = DateTimeOffset.UtcNow - lastValidTemperature > TimeSpan.FromSeconds(5);

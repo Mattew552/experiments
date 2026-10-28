@@ -8,7 +8,7 @@ internal static class FanDiscovery
     // which physical fan or motherboard header it belongs to.
     public static IReadOnlyList<DetectedFan> ActiveTachometers(IEnumerable<SensorInfo> sensors) =>
         sensors
-            .Where(s => s.Type == "Fan" && s.Id.StartsWith("/lpc/", StringComparison.OrdinalIgnoreCase)
+            .Where(s => s.Type == "Fan" && !s.Id.StartsWith("/gpu/", StringComparison.OrdinalIgnoreCase)
                         && s.Value is >= 100 and < 10000)
             .Select(s => new DetectedFan(s.Id, s.Hardware, s.Name, s.Value!.Value))
             .OrderBy(s => s.Hardware, StringComparer.OrdinalIgnoreCase)

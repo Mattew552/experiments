@@ -13,6 +13,9 @@ internal static class SelfTest
     }
     public static void Run()
     {
+        const string cpuFan = "/lpc/nct6797d/0/fan/1";
+        const string frontPair = "/lpc/nct6797d/0/fan/4";
+        const string frontTop = "/lpc/nct6797d/0/fan/5";
         var fake = new Fake();
         var cpu = new FanBinding { ControlId = "/lpc/chip/control/0", Role = FanRole.Cpu, MappingVerified = true, ReturnVerified = true, SpeedVerified = true, MinimumPercent = 40 };
         var caseFan = new FanBinding { ControlId = "/lpc/chip/control/1", Role = FanRole.FrontTop, MappingVerified = true, ReturnVerified = true, SpeedVerified = true, StopVerified = true };
@@ -39,6 +42,21 @@ internal static class SelfTest
             ExpectDenied(() => engine.SelectMode(FanMode.Manual));
         }
         if (invalidTemperatureHardware.Writes.Count != 0) throw new Exception("При 0 °C отправлена аппаратная команда");
+        var temperatures = new[]
+        {
+            new SensorInfo("/lpc/chip/temperature/0", "CPU", "Motherboard", "Temperature", 90),
+            new SensorInfo("/intelcpu/0/temperature/0", "CPU Package", "Intel Core", "Temperature", 54),
+            new SensorInfo("/intelcpu/0/temperature/1", "Core #1 Distance to TjMax", "Intel Core", "Temperature", 40)
+        };
+        if (CpuTemperatureReader.Read(temperatures) != 54 ||
+            CpuTemperatureReader.Read([temperatures[0]]) is not null ||
+            CpuTemperatureReader.Read([temperatures[1] with { Value = 0 }]) is not null)
+            throw new Exception("Температура CPU должна выбираться из достоверного датчика самого процессора");
+        if (CpuTemperatureReader.Read([
+                new SensorInfo("/amdcpu/0/temperature/2", "Core (Tctl/Tdie)", "AMD Ryzen", "Temperature", 46),
+                new SensorInfo("/amdcpu/0/temperature/3", "CCD1 (Tdie)", "AMD Ryzen", "Temperature", 44)
+            ]) != 46)
+            throw new Exception("AMD Tctl/Tdie должен сохраняться как источник температуры");
         Curves.Validate(Curves.Default(FanRole.Cpu), 40);
         var boundSettings = new Settings { MachineFingerprint = "machine-a" };
         if (!boundSettings.BelongsTo("machine-a") || boundSettings.BelongsTo("machine-b") || boundSettings.BelongsTo(""))
@@ -47,10 +65,10 @@ internal static class SelfTest
             throw new Exception("Неверная физическая схема каналов");
         if (!FanRoles.Label(FanRole.FrontPair).Contains("SYS_FAN3") || !FanRoles.Label(FanRole.FrontTop).Contains("SYS_FAN4"))
             throw new Exception("Неверное соответствие передних групп разъёмам");
-        var telemetry = new[] { new SensorInfo(Telemetry.FrontPair, "Fan #5", "Nuvoton NCT6797D", "Fan", 1030) };
-        if (Telemetry.Rpm(telemetry, Telemetry.FrontPair) != 1030 || Telemetry.Rpm(telemetry, Telemetry.FrontTop) != null)
+        var telemetry = new[] { new SensorInfo(frontPair, "Fan #5", "Nuvoton NCT6797D", "Fan", 1030) };
+        if (Telemetry.Rpm(telemetry, frontPair) != 1030 || Telemetry.Rpm(telemetry, frontTop) != null)
             throw new Exception("Автоматическое чтение RPM не должно подменять отсутствующий датчик");
-        var pairBinding = new FanBinding { Role = FanRole.FrontPair, RpmId = Telemetry.FrontPair, MappingVerified = true, ReturnVerified = true, SpeedVerified = true };
+        var pairBinding = new FanBinding { Role = FanRole.FrontPair, RpmId = frontPair, MappingVerified = true, ReturnVerified = true, SpeedVerified = true };
         if (Telemetry.RpmForRole(telemetry, [pairBinding], FanRole.FrontPair) != 1030 ||
             Telemetry.RpmForRole(telemetry, [], FanRole.FrontPair) != null)
             throw new Exception("Нельзя подписывать RPM без проверенной привязки на этом ПК");
@@ -61,6 +79,11 @@ internal static class SelfTest
         ]);
         if (discovered.Count != 1 || discovered[0].Rpm != 980)
             throw new Exception("Автообнаружение должно показывать только активные тахометры платы без записи GPU");
+        var embeddedFan = FanDiscovery.ActiveTachometers([
+            new SensorInfo("/ec/0/fan/1", "Chassis Fan", "Embedded Controller", "Fan", 840)
+        ]);
+        if (embeddedFan.Count != 1 || !Telemetry.Caption(embeddedFan[0], []).StartsWith("Датчик:", StringComparison.Ordinal))
+            throw new Exception("Новый тахометр должен отображаться без выдуманной физической роли");
         var processes = Diagnostics.ClassifyProcesses(["MSI.CentralServer", "MSI_Central_Service", "FanControl"]);
         if (processes.MsiBackground.Length != 2 || processes.OtherFanPrograms.Length != 1 || processes.OtherFanPrograms[0] != "FanControl")
             throw new Exception("Фоновые службы MSI ошибочно признаны активной программой управления");
@@ -74,15 +97,15 @@ internal static class SelfTest
         var live = new Fake { Sensors =
         [
             new SensorInfo("/amdcpu/0/temperature/2", "Core (Tctl/Tdie)", "AMD Ryzen 5 5600X", "Temperature", 45),
-            new SensorInfo(Telemetry.CpuFan, "Fan #2", "Nuvoton NCT6797D", "Fan", 1000),
-            new SensorInfo(Telemetry.FrontPair, "Fan #5", "Nuvoton NCT6797D", "Fan", 1000),
-            new SensorInfo(Telemetry.FrontTop, "Fan #6", "Nuvoton NCT6797D", "Fan", 1000)
+            new SensorInfo(cpuFan, "Fan #2", "Nuvoton NCT6797D", "Fan", 1000),
+            new SensorInfo(frontPair, "Fan #5", "Nuvoton NCT6797D", "Fan", 1000),
+            new SensorInfo(frontTop, "Fan #6", "Nuvoton NCT6797D", "Fan", 1000)
         ] };
         var verified = new Settings { Bindings =
         [
-            new FanBinding { ControlId = "/lpc/chip/control/1", RpmId = Telemetry.CpuFan, Role = FanRole.Cpu, MappingVerified = true, ReturnVerified = true, SpeedVerified = true, MinimumPercent = 40 },
-            new FanBinding { ControlId = "/lpc/chip/control/4", RpmId = Telemetry.FrontPair, Role = FanRole.FrontPair, MappingVerified = true, ReturnVerified = true, SpeedVerified = true, StopVerified = true, MinimumPercent = 40 },
-            new FanBinding { ControlId = "/lpc/chip/control/5", RpmId = Telemetry.FrontTop, Role = FanRole.FrontTop, MappingVerified = true, ReturnVerified = true, SpeedVerified = true, StopVerified = true, MinimumPercent = 40 }
+            new FanBinding { ControlId = "/lpc/chip/control/1", RpmId = cpuFan, Role = FanRole.Cpu, MappingVerified = true, ReturnVerified = true, SpeedVerified = true, MinimumPercent = 40 },
+            new FanBinding { ControlId = "/lpc/chip/control/4", RpmId = frontPair, Role = FanRole.FrontPair, MappingVerified = true, ReturnVerified = true, SpeedVerified = true, StopVerified = true, MinimumPercent = 40 },
+            new FanBinding { ControlId = "/lpc/chip/control/5", RpmId = frontTop, Role = FanRole.FrontTop, MappingVerified = true, ReturnVerified = true, SpeedVerified = true, StopVerified = true, MinimumPercent = 40 }
         ] };
         using (var engine = new Engine(live, verified))
         {

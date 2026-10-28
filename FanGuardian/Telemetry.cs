@@ -1,13 +1,7 @@
 namespace FanGuardian;
 
-// These RPM IDs were confirmed on this PC by individual 80%, 40% and 0% trials.
-// Merely reading a graph never changes the control allowlist.
 internal static class Telemetry
 {
-    public const string CpuFan = "/lpc/nct6797d/0/fan/1";
-    public const string FrontPair = "/lpc/nct6797d/0/fan/4";
-    public const string FrontTop = "/lpc/nct6797d/0/fan/5";
-
     public static float? Rpm(IReadOnlyList<SensorInfo> sensors, string id)
     {
         var value = sensors.FirstOrDefault(s => s.Type == "Fan" && s.Id == id)?.Value;
@@ -18,6 +12,12 @@ internal static class Telemetry
     {
         var binding = bindings.FirstOrDefault(b => b.Role == role && b.MappingVerified && b.ReturnVerified && b.SpeedVerified);
         return binding is null ? null : Rpm(sensors, binding.RpmId);
+    }
+
+    public static string Caption(DetectedFan fan, IEnumerable<FanBinding> bindings)
+    {
+        var binding = bindings.FirstOrDefault(b => b.RpmId == fan.Id && b.MappingVerified && b.ReturnVerified && b.SpeedVerified);
+        return binding is null ? $"Датчик: {fan.Hardware} / {fan.Name}" : binding.Label;
     }
 }
 

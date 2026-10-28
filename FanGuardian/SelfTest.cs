@@ -5,6 +5,9 @@ internal static class SelfTest
     private sealed class Fake : IFanHardware
     {
         public readonly List<string> Writes = new();
+        public IReadOnlyList<ControlChannel> Channels { get; } = Enumerable.Range(0, 7)
+            .Select(i => new ControlChannel("/lpc/chip/control/" + i, "/lpc/chip", "Fan " + i,
+                HardwareOrigin.Motherboard, RestoreStrategy.RestoreOriginal, true)).ToArray();
         public IReadOnlyList<SensorInfo> Sensors = Array.Empty<SensorInfo>();
         public IReadOnlyList<SensorInfo> Read() => Sensors;
         public void Set(string id, int value) => Writes.Add(id + ":" + value);
@@ -13,6 +16,11 @@ internal static class SelfTest
     }
     public static void Run()
     {
+        ModelMigrationTests.Run();
+        ProbeAlgorithmTests.Run();
+        SetupTests.Run();
+        HardwareCapabilityTests.Run();
+        WorkerHostTests.Run();
         const string cpuFan = "/lpc/nct6797d/0/fan/1";
         const string frontPair = "/lpc/nct6797d/0/fan/4";
         const string frontTop = "/lpc/nct6797d/0/fan/5";
@@ -84,23 +92,6 @@ internal static class SelfTest
         ]);
         if (embeddedFan.Count != 1 || !Telemetry.Caption(embeddedFan[0], []).StartsWith("Датчик:", StringComparison.Ordinal))
             throw new Exception("Новый тахометр должен отображаться без выдуманной физической роли");
-        var probeBefore = new[]
-        {
-            new SensorInfo("/intelcpu/0/temperature/0", "CPU Package", "Intel Core", "Temperature", 44),
-            new SensorInfo("/lpc/chip/control/2", "Fan #3", "Super I/O", "Control", 55),
-            new SensorInfo("/lpc/chip/fan/2", "Fan #3", "Super I/O", "Fan", 850),
-            new SensorInfo("/lpc/chip/fan/3", "Fan #4", "Super I/O", "Fan", 1000)
-        };
-        if (!FanProbe.MayStart(probeBefore, "/lpc/chip/control/2", 100) ||
-            FanProbe.MayStart(probeBefore, "/lpc/chip/control/2", 0) ||
-            FanProbe.MayStart(probeBefore, "/gpu/control/0", 100) ||
-            FanProbe.MayStart(probeBefore.Select(s => s.Type == "Temperature" ? s with { Value = 0 } : s), "/lpc/chip/control/2", 100))
-            throw new Exception("Проба разрешена без безопасной температуры или на запрещённом канале");
-        var probeAfter = probeBefore.Select(s => s.Id == "/lpc/chip/fan/2" ? s with { Value = 1120 } : s).ToArray();
-        var response = FanProbe.Compare("/lpc/chip/control/2", probeBefore, probeAfter);
-        if (response.IncreasedFans.Count != 1 || response.IncreasedFans[0].Id != "/lpc/chip/fan/2" ||
-            FanProbe.Compare("/lpc/chip/control/2", probeBefore, probeBefore).IncreasedFans.Count != 0)
-            throw new Exception("Проба неверно определила изменение RPM");
         var processes = Diagnostics.ClassifyProcesses(["MSI.CentralServer", "MSI_Central_Service", "FanControl"]);
         if (processes.MsiBackground.Length != 2 || processes.OtherFanPrograms.Length != 1 || processes.OtherFanPrograms[0] != "FanControl")
             throw new Exception("Фоновые службы MSI ошибочно признаны активной программой управления");

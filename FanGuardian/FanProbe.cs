@@ -1,41 +1,28 @@
 namespace FanGuardian;
 
-internal sealed record ProbeResponse(string ControlId, IReadOnlyList<DetectedFan> IncreasedFans)
-{
-    public string Description => IncreasedFans.Count switch
-    {
-        0 => "рост RPM не обнаружен; наличие вентилятора не определено",
-        1 => $"вероятная пара: {IncreasedFans[0].Name} [{IncreasedFans[0].Id}]",
-        _ => "несколько RPM изменились; соответствие неоднозначно: " +
-             string.Join(", ", IncreasedFans.Select(f => f.Name + " [" + f.Id + "]"))
-    };
-}
-
 internal static class FanProbe
 {
-    public static bool MayStart(IEnumerable<SensorInfo> sensors, string controlId, int percent) =>
-        percent == 100 && controlId.StartsWith("/lpc/", StringComparison.OrdinalIgnoreCase) &&
-        CpuTemperatureReader.Read(sensors) is >= 20 and < 65 &&
-        sensors.Any(s => s.Type == "Control" && s.Id == controlId && s.Value is >= 0 and < 95);
-
-    public static IReadOnlyList<SensorInfo> CandidateControls(IEnumerable<SensorInfo> sensors) => sensors
-        .Where(s => s.Type == "Control" && s.Id.StartsWith("/lpc/", StringComparison.OrdinalIgnoreCase)
-                    && s.Value is >= 0 and < 95)
-        .OrderBy(s => s.Id, StringComparer.Ordinal)
-        .ToArray();
-
-    public static ProbeResponse Compare(string controlId, IEnumerable<SensorInfo> before, IEnumerable<SensorInfo> after)
+    public static bool MayStart(IEnumerable<SensorInfo> sensors, ControlChannel channel, int percent)
     {
-        var baseline = before.Where(IsTachometer).ToDictionary(s => s.Id, s => s.Value!.Value, StringComparer.Ordinal);
-        var increased = after.Where(IsTachometer)
-            .Where(s => baseline.TryGetValue(s.Id, out var rpm) && s.Value!.Value >= 250 &&
-                        s.Value.Value - rpm >= Math.Max(150, rpm * 0.15f))
-            .Select(s => new DetectedFan(s.Id, s.Hardware, s.Name, s.Value!.Value))
-            .OrderBy(s => s.Id, StringComparer.Ordinal)
-            .ToArray();
-        return new ProbeResponse(controlId, increased);
+        var snapshot = sensors.ToArray();
+        return percent == 100 && channel.AllowsFanWrites && channel.MaximumPercent >= 100 &&
+               CpuTemperatureReader.Read(snapshot) is >= 20 and < 65 &&
+               snapshot.Any(s => s.Type == "Control" && s.Id == channel.Id &&
+                                 s.Origin == channel.Origin && DeviceId(s) == channel.DeviceId && s.Value is >= 0 and < 95);
     }
 
-    private static bool IsTachometer(SensorInfo s) => s.Type == "Fan" &&
-        !s.Id.StartsWith("/gpu/", StringComparison.OrdinalIgnoreCase) && s.Value is >= 0 and < 10000;
+    internal static bool IsTachometer(SensorInfo s) => s.Type == "Fan" && s.Origin != HardwareOrigin.Gpu &&
+        !s.Id.StartsWith("/gpu", StringComparison.OrdinalIgnoreCase) && s.Value.HasValue &&
+        float.IsFinite(s.Value.Value) && s.Value.Value >= 0;
+
+    internal static string DeviceId(SensorInfo sensor) =>
+        string.IsNullOrEmpty(sensor.DeviceId) ? ParentDevice(sensor.Id) : sensor.DeviceId;
+
+    private static string ParentDevice(string sensorId)
+    {
+        var separator = sensorId.LastIndexOf('/');
+        if (separator <= 0) return sensorId;
+        separator = sensorId.LastIndexOf('/', separator - 1);
+        return separator <= 0 ? sensorId : sensorId[..separator];
+    }
 }

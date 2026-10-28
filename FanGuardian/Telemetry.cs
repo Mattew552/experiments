@@ -5,7 +5,7 @@ internal static class Telemetry
     public static float? Rpm(IReadOnlyList<SensorInfo> sensors, string id)
     {
         var value = sensors.FirstOrDefault(s => s.Type == "Fan" && s.Id == id)?.Value;
-        return value is >= 0 and < 10000 ? value : null;
+        return value.HasValue && float.IsFinite(value.Value) && value.Value >= 0 ? value : null;
     }
 
     public static float? RpmForRole(IReadOnlyList<SensorInfo> sensors, IEnumerable<FanBinding> bindings, FanRole role)
@@ -17,7 +17,7 @@ internal static class Telemetry
     public static string Caption(DetectedFan fan, IEnumerable<FanBinding> bindings)
     {
         var binding = bindings.FirstOrDefault(b => b.RpmId == fan.Id && b.MappingVerified && b.ReturnVerified && b.SpeedVerified);
-        return binding is null ? $"Датчик: {fan.Hardware} / {fan.Name}" : binding.Label;
+        return binding is null ? $"Датчик: {fan.Hardware} / {fan.Name}" : binding.DisplayLabel;
     }
 }
 
@@ -25,7 +25,8 @@ internal sealed class RpmGraph : Control
 {
     private readonly Queue<float?> samples = new();
     private readonly Color lineColor;
-    public string Caption { get; }
+    [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
+    public string Caption { get; set; }
     private float? current;
 
     public RpmGraph(string caption, Color color)
@@ -58,9 +59,10 @@ internal sealed class RpmGraph : Control
         using var muted = new SolidBrush(Color.FromArgb(165, 174, 190));
         using var linePen = new Pen(lineColor, 2.5f);
         using var gridPen = new Pen(Color.FromArgb(55, 62, 76));
-        g.DrawString(Caption, title, Brushes.White, 18, 13);
         var value = current.HasValue ? $"{current.Value:F0} RPM" : "нет показаний";
         var valueSize = g.MeasureString(value, valueFont);
+        using var captionFormat = new StringFormat { Trimming = StringTrimming.EllipsisCharacter, FormatFlags = StringFormatFlags.NoWrap };
+        g.DrawString(Caption, title, Brushes.White, new RectangleF(18, 13, Math.Max(50, Width - valueSize.Width - 54), 32), captionFormat);
         g.DrawString(value, valueFont, Brushes.White, Width - valueSize.Width - 18, 9);
         var left = 18f; var right = Width - 18f; var top = 64f; var bottom = Height - 16f;
         g.DrawLine(gridPen, left, bottom, right, bottom);

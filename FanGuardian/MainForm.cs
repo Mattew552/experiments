@@ -6,7 +6,7 @@ namespace FanGuardian;
 
 internal sealed class MainForm : Form
 {
-    private readonly Settings settings = Settings.Load();
+    private readonly Settings settings;
     private readonly IFanHardware hardware;
     private readonly Engine engine;
     private readonly NotifyIcon tray = new();
@@ -26,11 +26,12 @@ internal sealed class MainForm : Form
     private bool exitRequested;
     private bool cleanedUp;
 
-    public MainForm()
+    public MainForm(IFanHardware? hardwareOverride = null, Settings? settingsOverride = null)
     {
         Text = "FanGuardian — управление вентиляторами";
         Width = 800; Height = 660; MinimumSize = new(780, 620);
-        hardware = new WorkerHardware(heartbeat); engine = new Engine(hardware, settings);
+        settings = settingsOverride ?? Settings.Load();
+        hardware = hardwareOverride ?? new WorkerHardware(heartbeat); engine = new Engine(hardware, settings);
         BackColor = Color.FromArgb(18, 21, 28);
         ForeColor = Color.White;
         var root = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, WrapContents = false, AutoScroll = true, Padding = new(18), BackColor = BackColor };
@@ -43,8 +44,8 @@ internal sealed class MainForm : Form
         root.Controls.Add(headline);
         root.Controls.Add(status);
         var modes = new FlowLayoutPanel { AutoSize = true };
-        modes.Controls.Add(Button("BIOS / Автоматически", () => Change(FanMode.Bios)));
-        modes.Controls.Add(Button("Передние выключены", () => Change(FanMode.CaseOff)));
+        modes.Controls.Add(Button("Исходный режим платы", () => Change(FanMode.Bios)));
+        modes.Controls.Add(Button("Корпусные выключены", () => Change(FanMode.CaseOff)));
         modes.Controls.Add(Button("Ручной режим", () => Change(FanMode.Manual)));
         root.Controls.Add(modes);
         var connect = new Button { Text = "Подключить новую систему", AutoSize = true, Margin = new(3, 2, 3, 8) };
@@ -78,7 +79,7 @@ internal sealed class MainForm : Form
         tray.DoubleClick += (_, _) => { Show(); WindowState = FormWindowState.Normal; Activate(); };
         var trayMenu = new ContextMenuStrip();
         trayMenu.Items.Add("Открыть", null, (_, _) => { Show(); WindowState = FormWindowState.Normal; Activate(); });
-        trayMenu.Items.Add("BIOS / Автоматически", null, (_, _) => Change(FanMode.Bios));
+        trayMenu.Items.Add("Исходный режим платы", null, (_, _) => Change(FanMode.Bios));
         trayMenu.Items.Add("Выход (вернуть BIOS)", null, (_, _) => Exit());
         tray.ContextMenuStrip = trayMenu;
         FormClosing += (_, e) =>
@@ -105,7 +106,11 @@ internal sealed class MainForm : Form
         };
         Directory.CreateDirectory(Settings.DirectoryPath);
         engine.Tick(); Render();
-        timer.Tick += (_, _) => { File.WriteAllText(heartbeat, DateTimeOffset.UtcNow.ToString("O")); engine.Tick(); Render(); };
+        timer.Tick += (_, _) =>
+        {
+            if (hardwareOverride is null) File.WriteAllText(heartbeat, DateTimeOffset.UtcNow.ToString("O"));
+            engine.Tick(); Render();
+        };
         timer.Start();
     }
     private static Button Button(string title, Action action)
@@ -117,21 +122,23 @@ internal sealed class MainForm : Form
     private void Render()
     {
         var cpuRpm = Telemetry.RpmForRole(engine.Sensors, settings.Bindings, FanRole.Cpu);
-        var waitingForFront = engine.Mode == FanMode.Bios && settings.Bindings.Where(b => FanRoles.IsFront(b.Role) && b.StopVerified)
-            .Any(b => engine.Sensors.FirstOrDefault(s => s.Id == b.RpmId)?.Value is null or < 250);
         headline.Text = "CPU  " + (engine.CpuTemperature?.ToString("F1") ?? "—") + " °C     Кулер  " + (cpuRpm?.ToString("F0") ?? "—") + " RPM";
-        status.Text = engine.Mode == FanMode.Bios
-            ? (waitingForFront ? "Возврат режима платы запрошен; передние вентиляторы раскручиваются" :
-                engine.Status.Contains("ожидание", StringComparison.OrdinalIgnoreCase) ? engine.Status : "Приложение не задаёт скорость. Фактический режим платы автоматически не определяется.")
-            : engine.Status + "  ·  Профиль: " + settings.Profiles[settings.SelectedProfile].Name;
+        status.Text = scanning ? "Проверка подключения: состояние показано в окне мастера"
+            : engine.Status + (engine.Mode == FanMode.Manual ? "  ·  Профиль: " + settings.Profiles[settings.SelectedProfile].Name : "");
         var access = Diagnostics.Read();
         diagnostics.Text = "Диагностика: " + access.Summary + (access.SensorAccessLikely ? "" : ". При 0 °C и отсутствии RPM управление заблокировано.");
-        var controlCount = engine.Sensors.Count(s => s.Type == "Control" && s.Id.StartsWith("/lpc/", StringComparison.OrdinalIgnoreCase));
+        var controlCount = hardware.Channels.Count(c => c.AllowsFanWrites);
         var rpmCount = FanDiscovery.ActiveTachometers(engine.Sensors).Count;
         discovery.Text = $"Найдено записей Control: {controlCount}; датчиков с ненулевыми RPM: {rpmCount}. Номера Fan # не определяют физическую роль или возможность управления.";
-        var hasPair = settings.Bindings.Any(b => b.Role == FanRole.FrontPair && b.MappingVerified && b.ReturnVerified && b.SpeedVerified);
-        var hasTop = settings.Bindings.Any(b => b.Role == FanRole.FrontTop && b.MappingVerified && b.ReturnVerified && b.SpeedVerified);
-        foreach (var fan in FanDiscovery.ActiveTachometers(engine.Sensors))
+        var verifiedCount = settings.Bindings.Count(b => b.IsVerified && FanRoles.IsControllable(b.Role));
+        var detectedFans = FanDiscovery.ActiveTachometers(engine.Sensors);
+        var displayedFans = detectedFans.Concat(settings.Bindings.Where(b => b.IsVerified && !detectedFans.Any(f => f.Id == b.RpmId))
+            .Select(b =>
+            {
+                var sensor = engine.Sensors.FirstOrDefault(s => s.Type == "Fan" && s.Id == b.RpmId);
+                return new DetectedFan(b.RpmId, sensor?.Hardware ?? "Проверенная группа", sensor?.Name ?? b.DisplayLabel, sensor?.Value ?? 0);
+            }));
+        foreach (var fan in displayedFans)
         {
             if (graphs.ContainsKey(fan.Id)) continue;
             var color = new[] { Color.FromArgb(75, 194, 255), Color.FromArgb(134, 224, 171), Color.FromArgb(255, 193, 113) }[graphs.Count % 3];
@@ -139,11 +146,18 @@ internal sealed class MainForm : Form
             graphs.Add(fan.Id, graph);
             graphPanel.Controls.Add(graph);
         }
-        foreach (var (id, graph) in graphs) graph.Add(Telemetry.Rpm(engine.Sensors, id));
-        footer.Text = hasPair && hasTop
-            ? "Графики обновляются автоматически. Передние каналы проверены на этом ПК. Задний вентилятор питается от Molex и не управляется программой."
-            : "Графики найденных тахометров обновляются автоматически. Их физические роли и каналы управления пока не проверены; запись выключена.";
-        tray.Text = ("FanGuardian: " + engine.Mode + "; CPU " + (engine.CpuTemperature?.ToString("F0") ?? "?")) switch { var s when s.Length > 63 => s[..63], var s => s };
+        foreach (var (id, graph) in graphs)
+        {
+            var fan = engine.Sensors.FirstOrDefault(s => s.Type == "Fan" && s.Id == id);
+            if (fan != null) graph.Caption = Telemetry.Caption(new DetectedFan(id, fan.Hardware, fan.Name, fan.Value ?? 0), settings.Bindings);
+            graph.Add(Telemetry.Rpm(engine.Sensors, id));
+        }
+        var legacyFronts = settings.Bindings.Any(b => FanRoles.IsFront(b.Role) && b.IsVerified);
+        footer.Text = verifiedCount > 0
+            ? $"Настроено групп: {verifiedCount}. Новые группы работают в проверенном ненулевом диапазоне; остановка доступна только после отдельной проверки." +
+              (legacyFronts ? " На этом ПК остановка касается передних групп; задний Molex продолжает работать." : "")
+            : "Датчики найдены автоматически. Для настройки управления нажмите «Подключить новую систему».";
+        tray.Text = ("FanGuardian: " + (scanning ? "проверка каналов" : engine.Mode) + "; CPU " + (engine.CpuTemperature?.ToString("F0") ?? "?")) switch { var s when s.Length > 63 => s[..63], var s => s };
         var selected = channels.SelectedIndex;
         channels.Items.Clear();
         foreach (var s in engine.Sensors.Where(s => s.Type is "Fan" or "Control"))
@@ -171,80 +185,23 @@ internal sealed class MainForm : Form
     private void ConnectSystem()
     {
         if (scanning) return;
-        engine.RestoreBios("Проверка новой системы");
+        if (engine.ControlBlockReason != null) throw new InvalidOperationException(engine.ControlBlockReason);
+        engine.RestoreBios("Подключение системы");
         if (engine.Status.StartsWith("Возврат BIOS не подтверждён", StringComparison.Ordinal))
             throw new InvalidOperationException("Сначала проверьте возврат управления плате");
-        var initial = hardware.Read();
-        if (CpuTemperatureReader.Read(initial) is not (>= 20 and < 65))
-            throw new InvalidOperationException("Нет достоверной безопасной температуры CPU");
-        if (Diagnostics.Read().OtherFanPrograms.Length > 0)
-            throw new InvalidOperationException("Закройте другую программу управления вентиляторами");
-        if (FanDiscovery.ActiveTachometers(initial).Count == 0)
-            throw new InvalidOperationException("Нет работающего тахометра для проверки охлаждения");
-        var candidates = FanProbe.CandidateControls(initial);
-        if (candidates.Count == 0)
-            throw new InvalidOperationException("Нет доступных каналов для пробы (каналы с 95–100% пропускаются)");
         if (hardware is not WorkerHardware worker) throw new InvalidOperationException("Сторож управления недоступен");
-
-        using var dialog = new Form { Text = "Подключить новую систему", Width = 760, Height = 480,
-            StartPosition = FormStartPosition.CenterParent, MinimumSize = new(600, 380) };
-        var progress = new Label { Dock = DockStyle.Top, Height = 70, Padding = new(12),
-            Text = "Программа по очереди задаст 100% каждому доступному каналу на три секунды и вернёт режим платы. Управление найденными каналами автоматически не включается." };
-        var report = new TextBox { Dock = DockStyle.Fill, Multiline = true, ReadOnly = true,
-            ScrollBars = ScrollBars.Both, WordWrap = false };
-        var close = new Button { Dock = DockStyle.Bottom, Height = 38, Text = "Остановить проверку" };
-        dialog.Controls.Add(report); dialog.Controls.Add(progress); dialog.Controls.Add(close);
-        using var cancellation = new CancellationTokenSource();
-        probeCancellation = cancellation;
+        using var dialog = new SystemSetupForm(hardware, worker, settings, reason =>
+        {
+            engine.BlockControl(reason);
+            try { worker.BlockControl(); }
+            catch (Exception ex) { AppLog.Write("Не удалось подтвердить блокировку сторожа: " + ex.Message); }
+        });
         scanning = true;
-        var running = true;
-        close.Click += (_, _) => { if (running) cancellation.Cancel(); else dialog.Close(); };
-        dialog.FormClosing += (_, e) =>
-        {
-            if (!running) return;
-            e.Cancel = true;
-            cancellation.Cancel();
-            progress.Text = "Останавливаем проверку и возвращаем управление плате…";
-        };
-        dialog.Shown += async (_, _) =>
-        {
-            try
-            {
-                for (var i = 0; i < candidates.Count; i++)
-                {
-                    cancellation.Token.ThrowIfCancellationRequested();
-                    var candidate = candidates[i];
-                    progress.Text = $"Проверка {i + 1}/{candidates.Count}: {candidate.Name} [{candidate.Id}]";
-                    var before = hardware.Read();
-                    if (CpuTemperatureReader.Read(before) is not (>= 20 and < 65) ||
-                        Diagnostics.Read().OtherFanPrograms.Length > 0)
-                        throw new InvalidOperationException("Проверка прервана: температура или конкурирующая программа");
-                    worker.ProbeStart(candidate.Id);
-                    try
-                    {
-                        await Task.Delay(3000, cancellation.Token);
-                        var after = hardware.Read();
-                        if (CpuTemperatureReader.Read(after) is not (>= 20 and < 65))
-                            throw new InvalidOperationException("Проверка прервана: высокая или недоступная температура CPU");
-                        var result = FanProbe.Compare(candidate.Id, before, after);
-                        report.AppendText($"{candidate.Name} [{candidate.Id}]: {result.Description}{Environment.NewLine}");
-                        AppLog.Write("Проба " + candidate.Id + ": " + result.Description);
-                    }
-                    finally { worker.ProbeEnd(candidate.Id); }
-                    await Task.Delay(1500, cancellation.Token);
-                }
-                progress.Text = "Проверка завершена. Найденные пары требуют подтверждения физического подключения перед управлением.";
-            }
-            catch (OperationCanceledException) { progress.Text = "Проверка остановлена; каналы возвращены плате."; }
-            catch (Exception ex)
-            {
-                progress.Text = "Проверка прервана. Проверьте охлаждение и журнал.";
-                report.AppendText("Ошибка: " + ex.Message + Environment.NewLine);
-                AppLog.Write("Ошибка проверки каналов: " + ex);
-            }
-            finally { running = false; scanning = false; probeCancellation = null; close.Text = "Закрыть"; }
-        };
-        dialog.ShowDialog(this);
+        probeCancellation = dialog.Cancellation;
+        try { dialog.ShowDialog(this); }
+        finally { scanning = false; probeCancellation = null; }
+        engine.Tick();
+        Render();
     }
     private void ShowDiagnostics()
     {
@@ -256,7 +213,9 @@ internal sealed class MainForm : Form
               string.Join(Environment.NewLine, detected.Select(f => $"{f.Hardware} / {f.Name}: {f.Rpm:F0} RPM [{f.Id}]"));
         var details = new TextBox { Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Both, WordWrap = false, Dock = DockStyle.Fill,
             Text = diagnostics.Text + Environment.NewLine + discovery.Text + Environment.NewLine + Environment.NewLine + detectedText +
-                   Environment.NewLine + Environment.NewLine + string.Join(Environment.NewLine, channels.Items.Cast<string>()) };
+                   Environment.NewLine + Environment.NewLine + string.Join(Environment.NewLine, channels.Items.Cast<string>()) +
+                   Environment.NewLine + Environment.NewLine + "Возможности выходов:" + Environment.NewLine +
+                   string.Join(Environment.NewLine, hardware.Channels.Select(c => $"{c.Name} [{c.Id}]: {c.Origin}, возврат {c.Restore}, запись {(c.AllowsFanWrites ? "доступна после настройки" : "запрещена")}")) };
         dialog.Controls.Add(details);
         dialog.ShowDialog(this);
     }
@@ -278,60 +237,10 @@ internal sealed class MainForm : Form
     }
     private void EditCurves()
     {
-        var bindings = new[] { FanRole.Cpu, FanRole.FrontPair, FanRole.FrontTop }
-            .Select(role => settings.Bindings.FirstOrDefault(b => b.Role == role && b.MappingVerified && b.ReturnVerified && b.SpeedVerified))
-            .OfType<FanBinding>().ToArray();
-        if (bindings.Length == 0) throw new InvalidOperationException("Сначала нужны подтверждённые каналы");
-        var profileIndex = profiles.SelectedIndex;
-        var profile = settings.Profiles[profileIndex];
-        using var dialog = new Form { Text = "Кривые · " + profile.Name, Width = 700, Height = 345, MinimumSize = new(700, 345), StartPosition = FormStartPosition.CenterParent,
-            BackColor = Color.FromArgb(25, 29, 38), ForeColor = Color.White, FormBorderStyle = FormBorderStyle.FixedDialog, MaximizeBox = false };
-        dialog.Controls.Add(new Label { Text = "Температура °C : скорость %. Например: 30:40, 50:55, 70:80, 85:100\nСкорость 40–100%; при нагреве она не должна уменьшаться.", Left = 18, Top = 15, Width = 650, Height = 50 });
-        var editors = new List<(FanBinding Binding, TextBox Input)>();
-        for (var i = 0; i < bindings.Length; i++)
-        {
-            var b = bindings[i];
-            var y = 82 + i * 51;
-            var name = b.Role switch { FanRole.Cpu => "Кулер CPU", FanRole.FrontPair => "Два передних вместе", _ => "Верхний передний" };
-            dialog.Controls.Add(new Label { Text = name, Left = 18, Top = y + 4, Width = 190, Height = 26 });
-            var points = profile.Curves.GetValueOrDefault(b.ControlId) ?? Curves.Default(b.Role, profileIndex);
-            var input = new TextBox { Text = string.Join(", ", points.Select(x => $"{x.Temperature}:{x.Percent}")), Left = 215, Top = y, Width = 450 };
-            dialog.Controls.Add(input);
-            editors.Add((b, input));
-        }
-        var save = new Button { Text = "Сохранить", Left = 545, Top = 260, Width = 120 };
-        var cancel = new Button { Text = "Отмена", Left = 420, Top = 260, Width = 110, DialogResult = DialogResult.Cancel };
-        save.Click += (_, _) =>
-        {
-            try
-            {
-                var changes = new Dictionary<string, List<CurvePoint>>();
-                foreach (var (binding, input) in editors)
-                {
-                    var points = new List<CurvePoint>();
-                    foreach (var token in input.Text.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-                    {
-                        var pair = token.Split(':', StringSplitOptions.TrimEntries);
-                        if (pair.Length != 2 || !int.TryParse(pair[0], out var temperature) || !int.TryParse(pair[1], out var percent))
-                            throw new ArgumentException("Используйте формат 30:40, 50:55, 70:80, 85:100");
-                        points.Add(new CurvePoint(temperature, percent));
-                    }
-                    Curves.Validate(points, Math.Max(40, binding.MinimumPercent));
-                    changes.Add(binding.ControlId, points);
-                }
-                foreach (var (id, points) in changes) profile.Curves[id] = points;
-                settings.Save();
-                AppLog.Write("Кривые профиля обновлены: " + profile.Name);
-                if (engine.Mode == FanMode.Manual) engine.Tick();
-                Render();
-                dialog.DialogResult = DialogResult.OK;
-                dialog.Close();
-            }
-            catch (Exception ex) { MessageBox.Show(dialog, ex.Message, "Проверьте кривые", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
-        };
-        dialog.Controls.Add(cancel); dialog.Controls.Add(save);
-        dialog.AcceptButton = save; dialog.CancelButton = cancel;
-        dialog.ShowDialog(this);
+        if (!CurveEditor.Show(this, settings, profiles.SelectedIndex)) return;
+        AppLog.Write("Кривые профиля обновлены: " + profiles.Text);
+        if (engine.Mode == FanMode.Manual) engine.Tick();
+        Render();
     }
     private void Exit()
     {
@@ -352,7 +261,7 @@ internal sealed class MainForm : Form
     }
     private void OnPowerModeChanged(object sender, PowerModeChangedEventArgs e)
     {
-        if (e.Mode is PowerModes.Suspend or PowerModes.Resume) BeginInvoke(() => { engine.RestoreBios("Сон/пробуждение Windows"); Render(); });
+        if (e.Mode is PowerModes.Suspend or PowerModes.Resume) BeginInvoke(() => { probeCancellation?.Cancel(); engine.RestoreBios("Сон/пробуждение Windows"); Render(); });
     }
     private void ToggleAutostart()
     {
@@ -370,7 +279,7 @@ internal sealed class MainForm : Form
     }
     protected override void Dispose(bool disposing)
     {
-        if (disposing) { timer.Dispose(); tray.Dispose(); }
+        if (disposing) { Cleanup(); timer.Dispose(); tray.Dispose(); }
         base.Dispose(disposing);
     }
 }

@@ -1,16 +1,21 @@
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace FanGuardian;
 
-internal enum FanRole { Cpu, FrontTop, FrontPair }
+internal enum FanRole { Cpu = 0, FrontTop = 1, FrontPair = 2, Case = 3, Unknown = 4, Pump = 5 }
 internal static class FanRoles
 {
     public static bool IsFront(FanRole role) => role is FanRole.FrontTop or FanRole.FrontPair;
+    public static bool IsCase(FanRole role) => IsFront(role) || role == FanRole.Case;
+    public static bool IsControllable(FanRole role) => role == FanRole.Cpu || IsCase(role);
     public static string Label(FanRole role) => role switch
     {
-        FanRole.Cpu => "CPU-кулер (ожидается CPU_FAN1)",
+        FanRole.Cpu => "CPU-кулер",
         FanRole.FrontTop => "Верхний передний (SYS_FAN4)",
         FanRole.FrontPair => "Два передних вместе (SYS_FAN3)",
+        FanRole.Case => "Корпусная группа",
+        FanRole.Pump => "Помпа (только показания)",
         _ => "Неизвестный канал"
     };
 }
@@ -21,12 +26,15 @@ internal sealed class FanBinding
     public string ControlId { get; set; } = "";
     public string RpmId { get; set; } = "";
     public string Label { get; set; } = "";
-    public FanRole Role { get; set; }
+    public FanRole Role { get; set; } = FanRole.Unknown;
     public int MinimumPercent { get; set; } = 30;
+    public int MinimumRunningRpm { get; set; } = 250;
     public bool MappingVerified { get; set; }
     public bool ReturnVerified { get; set; }
     public bool SpeedVerified { get; set; }
     public bool StopVerified { get; set; }
+    [JsonIgnore] public bool IsVerified => FanRoles.IsControllable(Role) && MappingVerified && ReturnVerified && SpeedVerified;
+    [JsonIgnore] public string DisplayLabel => string.IsNullOrWhiteSpace(Label) ? FanRoles.Label(Role) : Label;
 }
 internal sealed class FanProfile
 {
@@ -37,6 +45,7 @@ internal sealed class Settings
 {
     public int SchemaVersion { get; set; }
     public string MachineFingerprint { get; set; } = "";
+    public string HardwareFingerprint { get; set; } = "";
     public List<FanBinding> Bindings { get; set; } = new();
     public List<FanProfile> Profiles { get; set; } = new()
     {
@@ -44,6 +53,20 @@ internal sealed class Settings
     };
     public int SelectedProfile { get; set; } = 1;
     public bool BelongsTo(string fingerprint) => fingerprint.Length > 0 && MachineFingerprint == fingerprint;
+    // Pure migration boundary: no registry, file writes or serials in diagnostics.
+    public SettingsIdentityStatus ApplyIdentity(string machine, string hardware, bool allowLegacyBoard)
+    {
+        var oldSchema = SchemaVersion;
+        var rejected = oldSchema < 3 || oldSchema > 4 || !BelongsTo(machine) || hardware.Length == 0 ||
+            (HardwareFingerprint.Length > 0 && HardwareFingerprint != hardware) ||
+            (HardwareFingerprint.Length == 0 && Bindings.Count > 0 && !allowLegacyBoard);
+        if (rejected) Bindings.Clear();
+        var migrated = oldSchema != 4 || HardwareFingerprint != hardware || MachineFingerprint != machine;
+        SchemaVersion = 4;
+        MachineFingerprint = machine;
+        HardwareFingerprint = hardware;
+        return rejected ? SettingsIdentityStatus.Rejected : migrated ? SettingsIdentityStatus.Migrated : SettingsIdentityStatus.Current;
+    }
     public static string DirectoryPath => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "FanGuardian");
     public static string FilePath => Path.Combine(DirectoryPath, "settings.json");
     public static Settings Load()
@@ -51,44 +74,39 @@ internal sealed class Settings
         try
         {
             var result = JsonSerializer.Deserialize<Settings>(File.ReadAllText(FilePath)) ?? new();
-            if (result.Profiles.Count != 3) throw new InvalidDataException("Требуется ровно три профиля");
-            if (result.SchemaVersion < 3)
+            if (result.Profiles is null || result.Profiles.Count != 3 || result.Bindings is null)
+                throw new InvalidDataException("Повреждён список профилей или каналов");
+            result.SelectedProfile = Math.Clamp(result.SelectedProfile, 0, result.Profiles.Count - 1);
+            var identity = result.ApplyIdentity(MachineIdentity.Current, MachineIdentity.HardwareFingerprint, MachineIdentity.IsVerifiedLegacyBoard);
+            if (identity == SettingsIdentityStatus.Rejected)
+                AppLog.Write("Привязки отключены: изменилось оборудование, настройки другого ПК или идентификатор недоступен");
+            if (identity == SettingsIdentityStatus.Migrated)
             {
-                result.Bindings.Clear();
-                result.SchemaVersion = 3;
-                AppLog.Write("Старые привязки сброшены после уточнения подключения и этапа сопоставления BIOS");
+                var backup = FilePath + ".before-schema4.bak";
+                if (!File.Exists(backup)) File.Copy(FilePath, backup);
                 result.Save();
             }
-            var machine = MachineIdentity.Current;
-            if (!result.BelongsTo(machine))
-            {
-                if (result.Bindings.Count > 0) AppLog.Write("Привязки отключены: настройки принадлежат другому ПК или идентификатор недоступен");
-                result.Bindings.Clear();
-            }
-            var renamed = false;
-            foreach (var binding in result.Bindings.Where(b => Enum.IsDefined(b.Role)))
-            {
-                var label = FanRoles.Label(binding.Role);
-                if (binding.Label == label) continue;
-                binding.Label = label;
-                renamed = true;
-            }
-            if (renamed) result.Save();
             return result;
         }
-        catch (FileNotFoundException) { return new() { SchemaVersion = 3, MachineFingerprint = MachineIdentity.Current }; }
+        catch (FileNotFoundException) { return new() { SchemaVersion = 4, MachineFingerprint = MachineIdentity.Current, HardwareFingerprint = MachineIdentity.HardwareFingerprint }; }
         catch (Exception ex) { AppLog.Write("Настройки повреждены: " + ex.Message); return new(); }
     }
     public void Save()
     {
-        SchemaVersion = 3;
-        MachineFingerprint = MachineIdentity.Current;
+        var machine = MachineIdentity.Current;
+        var hardware = MachineIdentity.HardwareFingerprint;
+        if (Bindings.Any(b => b.IsVerified) && (machine.Length == 0 || hardware.Length == 0))
+            throw new InvalidOperationException("Невозможно сохранить разрешение управления без идентификатора ПК и платы");
+        SchemaVersion = 4;
+        MachineFingerprint = machine;
+        HardwareFingerprint = hardware;
         Directory.CreateDirectory(DirectoryPath);
         var tmp = FilePath + ".tmp";
         File.WriteAllText(tmp, JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true }));
         File.Move(tmp, FilePath, true);
     }
 }
+internal enum SettingsIdentityStatus { Current, Migrated, Rejected }
 internal static class Curves
 {
     public static List<CurvePoint> Default(FanRole role, int profileIndex = 1) => (role, profileIndex) switch

@@ -8,7 +8,8 @@ internal static class Program
     [STAThread]
     private static void Main(string[] args)
     {
-        if (args.Length > 0 && args[0] == "--self-test") { SelfTest.Run(); return; }
+        if (args.Length > 0 && args[0] == "--self-test") { AppLog.Suppressed = true; SelfTest.Run(); return; }
+        if (args.Length == 2 && args[0] == "--ui-smoke") { AppLog.Suppressed = true; UiSmoke.Run(args[1]); return; }
         if (args.Length > 0 && args[0] == "--probe")
         {
             Console.WriteLine(Diagnostics.Read().Summary);

@@ -38,6 +38,8 @@ internal sealed class WorkerHardware : IFanHardware
     public IReadOnlyList<SensorInfo> Read() => reader.Read();
     public void Set(string controlId, int percent) => Send("set", controlId, percent);
     public void Default(string controlId) => Send("default", controlId, 0);
+    public void ProbeStart(string controlId) => Send("probe-start", controlId, 100);
+    public void ProbeEnd(string controlId) => Send("probe-end", controlId, 0);
 
     private void Send(string operation, string id, int percent)
     {
@@ -89,6 +91,9 @@ internal static class WorkerHost
     {
         var ready = Path.Combine(directory, "ready");
         var touched = new HashSet<string>(StringComparer.Ordinal);
+        string? activeProbe = null;
+        DateTime probeDeadline = default;
+        DateTime nextProbeSafetyCheck = default;
         try
         {
             var settings = Settings.Load();
@@ -101,6 +106,23 @@ internal static class WorkerHost
                 long lastSequence = 0;
                 while (true)
                 {
+                    if (activeProbe != null && DateTime.UtcNow >= nextProbeSafetyCheck)
+                    {
+                        nextProbeSafetyCheck = DateTime.UtcNow.AddSeconds(1);
+                        var temperature = CpuTemperatureReader.Read(hardware.Read());
+                        if (DateTime.UtcNow >= probeDeadline || temperature is not (>= 20 and < 65) ||
+                            Diagnostics.Read().OtherFanPrograms.Length > 0)
+                        {
+                            try
+                            {
+                                hardware.Default(activeProbe);
+                                touched.Remove(activeProbe);
+                                AppLog.Write("Сторож: проба завершена " + activeProbe);
+                                activeProbe = null;
+                            }
+                            catch (Exception ex) { AppLog.Write("Сторож: ошибка возврата после пробы " + ex); }
+                        }
+                    }
                     bool alive;
                     try { alive = !Process.GetProcessById(parentPid).HasExited; } catch { alive = false; }
                     var stale = !File.Exists(heartbeat) || DateTime.UtcNow - File.GetLastWriteTimeUtc(heartbeat) > TimeSpan.FromSeconds(8);
@@ -123,8 +145,32 @@ internal static class WorkerHost
                             {
                                 switch (request.Operation)
                                 {
-                                    case "set": touched.Add(request.ControlId); safe.Set(request.ControlId, request.Percent); break;
-                                    case "default": safe.Default(request.ControlId); touched.Remove(request.ControlId); break;
+                                    case "set":
+                                        if (activeProbe != null) throw new InvalidOperationException("Во время пробы другая запись запрещена");
+                                        touched.Add(request.ControlId); safe.Set(request.ControlId, request.Percent); break;
+                                    case "default":
+                                        if (activeProbe != null) throw new InvalidOperationException("Во время пробы другая запись запрещена");
+                                        safe.Default(request.ControlId); touched.Remove(request.ControlId); break;
+                                    case "probe-start":
+                                    {
+                                        if (activeProbe != null || Diagnostics.Read().OtherFanPrograms.Length > 0)
+                                            throw new InvalidOperationException("Проба канала запрещена");
+                                        var sensors = safe.Read();
+                                        if (!FanProbe.MayStart(sensors, request.ControlId, request.Percent))
+                                            throw new InvalidOperationException("Нет безопасных показаний для пробы");
+                                        touched.Add(request.ControlId);
+                                        hardware.Set(request.ControlId, 100);
+                                        activeProbe = request.ControlId;
+                                        probeDeadline = DateTime.UtcNow.AddSeconds(6);
+                                        nextProbeSafetyCheck = DateTime.UtcNow.AddSeconds(1);
+                                        break;
+                                    }
+                                    case "probe-end":
+                                        if (activeProbe != request.ControlId) throw new InvalidOperationException("Нет активной пробы этого канала");
+                                        hardware.Default(request.ControlId);
+                                        touched.Remove(request.ControlId);
+                                        activeProbe = null;
+                                        break;
                                     case "shutdown": break;
                                     default: throw new InvalidOperationException("Неизвестная команда");
                                 }
@@ -145,7 +191,7 @@ internal static class WorkerHost
             {
                 foreach (var id in touched)
                 {
-                    try { safe.Default(id); AppLog.Write("Сторож: восстановлен исходный режим " + id); }
+                    try { hardware.Default(id); AppLog.Write("Сторож: восстановлен исходный режим " + id); }
                     catch (Exception ex) { AppLog.Write("Сторож: ОШИБКА восстановления " + id + " " + ex); }
                 }
             }

@@ -21,6 +21,8 @@ internal sealed class MainForm : Form
     private readonly Dictionary<string, RpmGraph> graphs = new(StringComparer.Ordinal);
     private readonly ComboBox profiles = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 230 };
     private readonly string heartbeat = Path.Combine(Settings.DirectoryPath, "heartbeat");
+    private CancellationTokenSource? probeCancellation;
+    private bool scanning;
     private bool exitRequested;
     private bool cleanedUp;
 
@@ -45,6 +47,9 @@ internal sealed class MainForm : Form
         modes.Controls.Add(Button("Передние выключены", () => Change(FanMode.CaseOff)));
         modes.Controls.Add(Button("Ручной режим", () => Change(FanMode.Manual)));
         root.Controls.Add(modes);
+        var connect = new Button { Text = "Подключить новую систему", AutoSize = true, Margin = new(3, 2, 3, 8) };
+        connect.Click += (_, _) => RunAdvanced(ConnectSystem);
+        root.Controls.Add(connect);
         var manualSettings = new FlowLayoutPanel { AutoSize = true, FlowDirection = FlowDirection.LeftToRight, WrapContents = false, Margin = new(3, 0, 3, 8) };
         manualSettings.Controls.Add(new Label { Text = "Профиль ручного режима:", AutoSize = true, Margin = new(3, 7, 8, 3), ForeColor = Color.FromArgb(165, 174, 190) });
         manualSettings.Controls.Add(profiles);
@@ -150,6 +155,7 @@ internal sealed class MainForm : Form
     }
     private void Change(FanMode mode)
     {
+        if (scanning) throw new InvalidOperationException("Дождитесь завершения проверки каналов");
         if (mode != FanMode.Bios && !settings.Bindings.Any(b => b.MappingVerified && b.ReturnVerified && b.SpeedVerified))
         {
             MessageBox.Show("Показания вентиляторов уже доступны. Для управления нужна однократная проверка соответствия разъёмов и каналов на этом ПК. Пока команды вентиляторам не отправляются.", "Аппаратная проверка", MessageBoxButtons.OK, MessageBoxIcon.Information);
@@ -161,6 +167,84 @@ internal sealed class MainForm : Form
     {
         try { action(); }
         catch (Exception ex) { AppLog.Write("Ошибка UI: " + ex.Message); MessageBox.Show(ex.Message, "FanGuardian", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
+    }
+    private void ConnectSystem()
+    {
+        if (scanning) return;
+        engine.RestoreBios("Проверка новой системы");
+        if (engine.Status.StartsWith("Возврат BIOS не подтверждён", StringComparison.Ordinal))
+            throw new InvalidOperationException("Сначала проверьте возврат управления плате");
+        var initial = hardware.Read();
+        if (CpuTemperatureReader.Read(initial) is not (>= 20 and < 65))
+            throw new InvalidOperationException("Нет достоверной безопасной температуры CPU");
+        if (Diagnostics.Read().OtherFanPrograms.Length > 0)
+            throw new InvalidOperationException("Закройте другую программу управления вентиляторами");
+        if (FanDiscovery.ActiveTachometers(initial).Count == 0)
+            throw new InvalidOperationException("Нет работающего тахометра для проверки охлаждения");
+        var candidates = FanProbe.CandidateControls(initial);
+        if (candidates.Count == 0)
+            throw new InvalidOperationException("Нет доступных каналов для пробы (каналы с 95–100% пропускаются)");
+        if (hardware is not WorkerHardware worker) throw new InvalidOperationException("Сторож управления недоступен");
+
+        using var dialog = new Form { Text = "Подключить новую систему", Width = 760, Height = 480,
+            StartPosition = FormStartPosition.CenterParent, MinimumSize = new(600, 380) };
+        var progress = new Label { Dock = DockStyle.Top, Height = 70, Padding = new(12),
+            Text = "Программа по очереди задаст 100% каждому доступному каналу на три секунды и вернёт режим платы. Управление найденными каналами автоматически не включается." };
+        var report = new TextBox { Dock = DockStyle.Fill, Multiline = true, ReadOnly = true,
+            ScrollBars = ScrollBars.Both, WordWrap = false };
+        var close = new Button { Dock = DockStyle.Bottom, Height = 38, Text = "Остановить проверку" };
+        dialog.Controls.Add(report); dialog.Controls.Add(progress); dialog.Controls.Add(close);
+        using var cancellation = new CancellationTokenSource();
+        probeCancellation = cancellation;
+        scanning = true;
+        var running = true;
+        close.Click += (_, _) => { if (running) cancellation.Cancel(); else dialog.Close(); };
+        dialog.FormClosing += (_, e) =>
+        {
+            if (!running) return;
+            e.Cancel = true;
+            cancellation.Cancel();
+            progress.Text = "Останавливаем проверку и возвращаем управление плате…";
+        };
+        dialog.Shown += async (_, _) =>
+        {
+            try
+            {
+                for (var i = 0; i < candidates.Count; i++)
+                {
+                    cancellation.Token.ThrowIfCancellationRequested();
+                    var candidate = candidates[i];
+                    progress.Text = $"Проверка {i + 1}/{candidates.Count}: {candidate.Name} [{candidate.Id}]";
+                    var before = hardware.Read();
+                    if (CpuTemperatureReader.Read(before) is not (>= 20 and < 65) ||
+                        Diagnostics.Read().OtherFanPrograms.Length > 0)
+                        throw new InvalidOperationException("Проверка прервана: температура или конкурирующая программа");
+                    worker.ProbeStart(candidate.Id);
+                    try
+                    {
+                        await Task.Delay(3000, cancellation.Token);
+                        var after = hardware.Read();
+                        if (CpuTemperatureReader.Read(after) is not (>= 20 and < 65))
+                            throw new InvalidOperationException("Проверка прервана: высокая или недоступная температура CPU");
+                        var result = FanProbe.Compare(candidate.Id, before, after);
+                        report.AppendText($"{candidate.Name} [{candidate.Id}]: {result.Description}{Environment.NewLine}");
+                        AppLog.Write("Проба " + candidate.Id + ": " + result.Description);
+                    }
+                    finally { worker.ProbeEnd(candidate.Id); }
+                    await Task.Delay(1500, cancellation.Token);
+                }
+                progress.Text = "Проверка завершена. Найденные пары требуют подтверждения физического подключения перед управлением.";
+            }
+            catch (OperationCanceledException) { progress.Text = "Проверка остановлена; каналы возвращены плате."; }
+            catch (Exception ex)
+            {
+                progress.Text = "Проверка прервана. Проверьте охлаждение и журнал.";
+                report.AppendText("Ошибка: " + ex.Message + Environment.NewLine);
+                AppLog.Write("Ошибка проверки каналов: " + ex);
+            }
+            finally { running = false; scanning = false; probeCancellation = null; close.Text = "Закрыть"; }
+        };
+        dialog.ShowDialog(this);
     }
     private void ShowDiagnostics()
     {
@@ -259,6 +343,7 @@ internal sealed class MainForm : Form
     {
         if (cleanedUp) return;
         cleanedUp = true;
+        probeCancellation?.Cancel();
         timer.Stop();
         try { engine.Dispose(); }
         catch (Exception ex) { AppLog.Write("Ошибка завершения управления: " + ex); }

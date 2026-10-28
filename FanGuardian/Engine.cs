@@ -140,6 +140,7 @@ internal sealed class Engine : IDisposable
         }
         Mode = FanMode.Bios;
         pendingMode = null;
+        if (failures.Count == 0) Status = "Охлаждение BIOS";
         AppLog.Write($"Возврат BIOS ({reason}): " + (failures.Count == 0 ? "команды выполнены" : string.Join("; ", failures)));
         if (failures.Count > 0) Status = "Возврат BIOS не подтверждён; проверьте вентиляторы и журнал";
     }
